@@ -14,7 +14,7 @@ import math
 
 
 # Load dataset
-def load_dataset(data_folder="./audio_mel"):
+def load_dataset(data_folder="./audio_mel", norm_spect=True, norm_pal_rgbs=True, n_samples=None):
     clip_list = os.listdir(data_folder)
 
     # ensure clips are sorted by song-clip
@@ -22,24 +22,35 @@ def load_dataset(data_folder="./audio_mel"):
     clip_list.sort(reverse=False)
 
     song_ids, spectrograms, palettes = [], [], []
+    count = 0
     for song_id, clip_id, clip in clip_list:
         with open(Path(data_folder) / Path(clip), 'rb') as f:
             s, p = dill.load(f)  
+        if norm_spect:
+            s = s.astype(np.float32) / s.max()
+        if norm_pal_rgbs:
+            p = p.astype(np.float32) / 255
         song_ids.append(song_id)
-        spectrograms.append(s[np.newaxis, ...]) ##add "channel" dim
-        palettes.append(p)
+        spectrograms.append(s[np.newaxis, ...].astype(np.float32)) ##add "channel" dim
+        palettes.append(p.astype(np.float32))
+        count += 1
+        if n_samples is not None and count >= n_samples:
+            break
     
     return spectrograms, palettes, song_ids
-
+    
 def get_inds(ls, song_id:int):
     return [i for i,el in enumerate(ls) if el==int(song_id)]
 
 def load_and_split_data(data_folder,
+                        norm_spectogram=True,
+                        norm_palette_rgbs=True,
+                        n_samples=None,
                         test_size=0.2,
                         valid_size=0.1,
                         random_seed=123):
-    # load and get train, valid, test splits, stratified by song
-    spec, pal, song_ids = load_dataset(data_folder)
+    # load and make train, valid, test splits, stratified by song
+    spec, pal, song_ids = load_dataset(data_folder, norm_spectogram, norm_palette_rgbs, n_samples)
     unique_songs = list(set(song_ids))
     random.Random(random_seed).shuffle(unique_songs)
 
@@ -57,6 +68,7 @@ def load_and_split_data(data_folder,
         X_train += [spec[i] for i in inds]
         Y_train += [pal[i]  for i in inds]
         s_train += [song_ids[i] for i in inds]
+        
     for song in valid_songs:
         inds = get_inds(song_ids, song)
         X_val += [spec[i] for i in inds]
@@ -109,15 +121,21 @@ def prep_next_song(song_ids_split, ##song ids
     return final_song_inds, final_spects, final_pals
 
 
-
-def rgb_accuracy(pred_tensor, truth_tensor, window_size):
-    window = int(window_size/2)
+@torch.no_grad()
+def rgb_accuracy(pred_tensor, truth_tensor, window_size, scale_rgb=True):
     assert pred_tensor.size(0) == truth_tensor.size(0)
+    pred = pred_tensor.clone()
+    truth = truth_tensor.clone()
+
+    if scale_rgb:
+        pred *= 255
+        truth *= 255
+    window = int(window_size/2)
 
     batch_sum = 0
-    for b in range(pred_tensor.size(0)):
+    for b in range(pred.size(0)):
         correct = 0
-        for pred_color, true_color in zip(pred_tensor[b], truth_tensor[b]):
+        for pred_color, true_color in zip(pred[b], truth[b]):
             pred_color = pred_color.tolist()
             true_color = true_color.tolist()
             for v in range(3):
@@ -125,15 +143,38 @@ def rgb_accuracy(pred_tensor, truth_tensor, window_size):
                     correct += 1
         batch_sum += correct
     
-    return batch_sum / (pred_tensor.size(0) * pred_tensor.size(1) * 3) #batch_size * n_colors * 3[rgb]
+    return batch_sum / (pred.size(0) * pred.size(1) * 3) #batch_size * n_colors * 3[rgb]
 
 
 def quick_color_display(rgb:list, h=30, w=30):
     """plt.imshow(quick_color_display([10, 123, 30]))
     """
+    rgb = [round(v) for v in rgb]
     block = np.zeros((h, w, 3))
     block[:,:,:] = rgb
     return block.astype(np.uint8)
+
+#import colorsys
+#colorsys.rgb_to_hsv
+# def rgb_to_hue(rgb:np.array):
+#     rgb = rgb.astype(np.float64) / 255.
+#     max_i = np.argmax(rgb)
+#     min_i = np.argmin(rgb)
+#     diff  = max_i - min_i
+#     if diff == 0:
+#         hue = 0
+#     else:
+#         match max_i:
+#             case 0: #r
+#                 hue = (rgb[1]-rgb[2]) / diff #g-b / max-min
+#             case 1: #g
+#                 hue = 2. + (rgb[2]-rgb[0]) / diff #2 + b-r / max-min
+#             case 2: #b
+#                 hue = 4. + (rgb[0]-rgb[1]) / diff #5 + r-g / max-min
+#         hue *= 60
+#         if hue < 0:
+#             hue += 360
+#     return hue
 
 
 def generate_spectograms(meta,
@@ -162,8 +203,9 @@ def generate_spectograms(meta,
         
         y, sr = librosa.load(wav_path, sr=sample_rate)
         spec = librosa.feature.melspectrogram(y=y, sr=sr,
-                                            n_mels=n_mels, n_fft=n_fft,
-                                            hop_length=hop_length)
+                                             n_mels=n_mels, 
+                                             n_fft=n_fft,
+                                             hop_length=hop_length)
         # convert to log scale (dB scale)
         log_spec = librosa.amplitude_to_db(spec, ref=1.)
 
