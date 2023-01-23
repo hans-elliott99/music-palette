@@ -187,15 +187,16 @@ class SeqAudioRgbDataset(torch.utils.data.Dataset):
                  paths_list:list,
                  data_dir:str, 
                  max_seq_length:int, 
-                #  pad_short_seqs=True,
+                 pad_short_seqs=True,
                  X_transform=None, 
                  y_transform=None) -> None:
         super().__init__()
-        self.data_dir = Path(data_dir)
-        self.paths_list = paths_list
+        self.data_dir    = Path(data_dir)
+        self.paths_list  = paths_list
         self.max_seq_len = max_seq_length
         self.X_transform = X_transform
         self.y_transform = y_transform
+        self.do_pad      = pad_short_seqs
 
     def __len__(self):
         return len(self.paths_list)
@@ -209,7 +210,7 @@ class SeqAudioRgbDataset(torch.utils.data.Dataset):
         X = torch.tensor(self.preprocess_spec(X))
         y = torch.tensor(self.preprocess_pal(y))
 
-        if X.shape[0] < self.max_seq_len:
+        if X.shape[0] < self.max_seq_len and self.do_pad:
             X = self.pad_X(X)
             y = self.pad_y(y)
         return X, y

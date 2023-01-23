@@ -1,5 +1,4 @@
 
-import os
 import time
 import random
 import wandb 
@@ -8,7 +7,7 @@ from dotenv import dotenv_values
 import numpy as np
 import torch
 import torch.nn as nn
-import models.transformers as models
+import models.models_rnn as models_rnn
 import utils
 import dataload
 
@@ -17,86 +16,96 @@ import dataload
 def batched_trainloop(train_dataloader, model, criterion, optimizer, config, device, batch_print_freq=10):
     
     model.train()
+
     losses, accs, dists, batch_times = (utils.RunningMean() for _ in range(4))
 
-    for step, (X, y) in enumerate(train_dataloader):
-
+    for i, (X, y) in enumerate(train_dataloader):
+        batch_loss = 0
+        rgb_dist, rgb_acc = 0, 0
         time0 = time.time()
 
         # Put data on device
         X = X.to(device)
         y = y.to(device)
 
-        batch_size = X.shape[0]
-        seq_len    = X.shape[1]
-
         # FORWARD PASS
-        logits_flat = model(X, device) #(b, T, n_colors*3)
-        logits_mat = logits_flat.reshape(batch_size, seq_len, model.n_colors, 3) #(b, T, n_colors, rgb[3])
+        seq_iters = X.shape[1] #max_seq_length 
+        
+        # inner-loop: process each (batch) of the sequences step-by-step
+        h0 = model.init_hidden(batch_size=X.shape[0]).to(device)
+        for step in range(seq_iters):
+            x_s = X[:, step, :]
+            logits_flat, h0 = model(x_s, h0)
+            logits_mat = logits_flat.reshape(logits_flat.shape[0], model.n_colors, 3) #(b, n_colors, rgb[3])
+           
+            truth_mat = y[:, step, :model.n_colors]
+            truth_flat  = truth_mat.view(truth_mat.size(0), -1) #(b, n_colors*3)
+           
+            batch_loss += criterion(logits_flat, truth_flat)
 
-        truth_mat = y[:,:, :model.n_colors]   #(b, T, n_colors, 3)
-        truth_flat = truth_mat.reshape(batch_size, seq_len, -1) #(b, T, n_colors*3)
-        loss = criterion(logits_flat, truth_flat)
+            # metrics
+            rgb_dist += utils.redmean_rgb_dist(logits_mat, truth_mat, scale_rgb=True)
+            rgb_acc += utils.rgb_accuracy(logits_mat, truth_mat, scale_rgb=True, window_size=10)
 
-        # BACKWARDS
-        loss.backward()
+        # BACKPROP (through time)
+        batch_loss.backward(retain_graph=True)
+        h0.detach_() ##detach hidden state
+
+        # OPTIMIZE
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-
-        # Calc metrics
-        rgb_dist, rgb_acc = 0, 0
-        for i in range(seq_len):
-            rgb_dist += utils.redmean_rgb_dist(logits_mat[:, i, :], truth_mat[:, i, :], scale_rgb=True)
-            rgb_acc  += utils.rgb_accuracy(logits_mat[:, i, :], truth_mat[:, i, :], scale_rgb=True, window_size=10)
-        
         # Track metrics
-        losses.update(loss.item())
-        accs.update(rgb_acc/seq_len)
-        dists.update(rgb_dist.item()/seq_len)
+        losses.update(batch_loss.item())
+        accs.update(rgb_acc/seq_iters)
+        dists.update(rgb_dist.item()/seq_iters)
         batch_times.update(time.time() - time0)
 
-
-        if step % batch_print_freq == 0 or step==len(train_dataloader)-1:
-            print(f" [Batch {step+1}/{len(train_dataloader)} (et={batch_times.last :.2f}s)]")
+        if i % batch_print_freq == 0 or i==len(train_dataloader)-1:
+            print(f" [Batch {i+1}/{len(train_dataloader)} (et={batch_times.last :.2f}s)]")
             print(f" \tLoss={losses.last :.5f} \tRGBdist={dists.last :.5f} \tAcc={accs.last :.5f}")
 
     return losses, dists, accs 
-
 
 
 @torch.no_grad()
 def batched_validloop(valid_dataloader, model, criterion, config, device):
     
     model.eval()
+
     losses, accs, dists = (utils.RunningMean() for _ in range(3))
-    
     for i, (X, y) in enumerate(valid_dataloader):
+        rgb_dist = 0
+        rgb_acc = 0
+        batch_loss = 0
 
         X = X.to(device)
         y = y.to(device)
 
-        batch_size = X.shape[0]
-        seq_len    = X.shape[1]
-
-        # FORWARD PASS
-        logits_flat = model(X, device) #(b, T, n_colors*3)
-        logits_mat = logits_flat.reshape(batch_size, seq_len, model.n_colors, 3) #(b, T, n_colors, rgb[3])
-
-        truth_mat = y[:,:, :model.n_colors]   #(b, T, n_colors, 3)
-        truth_flat = truth_mat.reshape(batch_size, seq_len, -1)  #(b, T, n_colors*3)
-        loss = criterion(logits_flat, truth_flat)
-
-        # Calc metrics
-        rgb_dist, rgb_acc = 0, 0
-        for i in range(seq_len):
-            rgb_dist += utils.redmean_rgb_dist(logits_mat[:, i, :], truth_mat[:, i, :], scale_rgb=True)
-            rgb_acc  += utils.rgb_accuracy(logits_mat[:, i, :], truth_mat[:, i, :], scale_rgb=True, window_size=10)
+        # FORWARD
+        seq_iters = X.shape[1] #max_seq_length 
         
+        # inner-loop: process each (batch) of the sequences step-by-step
+        h0 = model.init_hidden(batch_size=X.shape[0]).to(device)
+        for s in range(seq_iters):
+            x_s = X[:, s, :]
+            logits_flat, h0 = model(x_s, h0)
+            logits_mat = logits_flat.reshape(logits_flat.shape[0], model.n_colors, 3) #(b, n_colors, rgb[3])
+
+            truth_mat = y[:, s, :model.n_colors]
+            truth_flat  = truth_mat.view(truth_mat.size(0), -1) #(b, n_colors*3)
+            
+            batch_loss += criterion(logits_flat, truth_flat)
+
+            # metrics
+            rgb_dist += utils.redmean_rgb_dist(logits_mat, truth_mat, scale_rgb=True)
+            rgb_acc += utils.rgb_accuracy(logits_mat, truth_mat, scale_rgb=True, window_size=10)
+            # preds.append(logits_mat)
+
         # Track metrics
-        losses.update(loss.item())
-        accs.update(rgb_acc/seq_len)
-        dists.update(rgb_dist.item()/seq_len)
+        losses.update(batch_loss.item())
+        accs.update(rgb_acc/seq_iters)
+        dists.update(rgb_dist.item()/seq_iters)
     
     return losses, dists, accs
 
@@ -108,20 +117,19 @@ if __name__=="__main__":
     AUDIO_DIR      = "audio_wav"
     SPLITMETA_PATH = "./train_test_songs.json"
     
-    LOG_WANDB              = False
+    LOG_WANDB              = True
 
-    MODEL_SAVE_NAME        = "transformer_1"
-    LOAD_CHECKPOINT        = f"./checkpoints/{MODEL_SAVE_NAME}.pth" #will create if doesnt exist
-    LOAD_CHECKPOINT_CONFIG = f"./checkpoints/{MODEL_SAVE_NAME}.json"
+    LOAD_CHECKPOINT        = "./checkpoints/chkpnt_1col.pth"
+    LOAD_CHECKPOINT_CONFIG = "./checkpoints/chkpnt_1col_config.json"
     SAVE_CHECKPOINT        = True
+    MODEL_SAVE_NAME        = "chkpnt_1col"
 
     config = {
         # Model specs
         "n_colors"        : 1,
         "max_seq_length"  : 5,
-        "n_heads"         : 4,
-        "n_layers"        : 4,
-        "dropout"         : 0.,
+        "dropout"         : 0.5,
+        "gru_hidden_size" : 64,
 
         # Training specs
         "batch_size" : 8,
@@ -143,7 +151,7 @@ if __name__=="__main__":
         wandb.init(
             project="MusicPalette",
             config=config,
-            group="ConvTransformer",
+            group="Seq_RNN_CNN",
             anonymous="allow"
         )
 
@@ -196,20 +204,13 @@ if __name__=="__main__":
     )
 
     # -------------------------PREPARE MODEL------------------------- #
-    model_exists = False
-    if LOAD_CHECKPOINT is not None:
-        if os.path.exists(LOAD_CHECKPOINT):
-            model_exists = True
-
     start_epoch = 0
-    if not LOAD_CHECKPOINT or not model_exists:
+    if not LOAD_CHECKPOINT:
         ex_x, _ = train_dataset[0]
-        model = models.ConvTransformer(
+        model = models_rnn.SeqRNNConv(
             X_shape=ex_x.shape,
-            max_seq_len=config["max_seq_length"],
             n_colors=config["n_colors"],
-            n_heads=config["n_heads"],
-            n_layers=config["n_layers"],
+            gru_hidden_size=config["gru_hidden_size"],
             dropout=config["dropout"]
         )
     else:

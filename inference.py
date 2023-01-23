@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import torch
 import utils
 import dataload
-import models
+import models.models_rnn as models_rnn
 
 
 def load_prep_model(model_path):
@@ -81,7 +81,7 @@ if __name__=="__main__":
     device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     
     model_path = "./checkpoints/chkpnt_0.pth"
-    model:models.SeqRNNConv = torch.load(model_path)
+    model:models_rnn.SeqRNNConv = torch.load(model_path)
     model = model.to(device)
     model.eval()
     # hidden = model.init_hidden(batch_size=1)
