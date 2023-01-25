@@ -22,7 +22,7 @@ class AttHead(nn.Module):
         # Compute attention scores ("affinities")
         wei = q @ k.transpose(-2, -1) * C**-0.5 #scaled, out:(B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) #(B,T,T)
-        wei = F.softmax(wei, dim=1)
+        wei = F.softmax(wei, dim=-1) #(B, T)
         wei = self.dropout(wei)
         # weigted aggregation
         v = self.value(x)
@@ -46,12 +46,57 @@ class MultiHeadAttention(nn.Module):
         return self.dropout(out)
 
 
+class CausalSelfAttention(nn.Module):
+    """
+    https://github.com/karpathy/minGPT/blob/master/mingpt/model.py#L30
+    """
+    def __init__(self, block_size, n_embed, n_head, attn_dropout=0., resid_dropout=0.):
+        super().__init__()
+        assert n_embed % n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(n_embed, 3 * n_embed)
+        # output projection
+        self.c_proj = nn.Linear(n_embed, n_embed)
+        # regularization
+        self.attn_dropout = nn.Dropout(attn_dropout)
+        self.resid_dropout = nn.Dropout(resid_dropout)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size))
+                                        .view(1, 1, block_size, block_size))
+        self.n_head = n_head
+        self.n_embd = n_embed
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+
+
+
+
 class FeedForward(nn.Module):
     def __init__(self, in_feats, dropout) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_feats, 4*in_feats), #times 4, as in Attention is All You Need
-            nn.ReLU(),
+            nn.GELU(),
             # project back into residual pathway
             nn.Linear(4*in_feats, in_feats),
             nn.Dropout(dropout)
@@ -73,18 +118,18 @@ class TfmrBlock(nn.Module):
         self.ln1 = nn.LayerNorm(in_feats)
         self.sa = MultiHeadAttention(block_size, n_heads, head_size, in_feats, dropout)
         self.ln2 = nn.LayerNorm(in_feats)
-        self.ffwd = FeedForward(in_feats, dropout)
+        self.mlp = FeedForward(in_feats, dropout)
     
     def forward(self, x):
-        x = x + self.sa(self.ln1(x)) #skep connections
-        x = x + self.ffwd(self.ln2(x))
+        x = x + self.sa(self.ln1(x)) #skip connections
+        x = x + self.mlp(self.ln2(x))
         return x
 
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, conv_filters, kernel_size, pool_size, dropout, conv_activ=nn.GELU) -> None:
         super().__init__()
-        self.conv = nn.Conv2d(in_channels=in_channels, #(1 channel)
+        self.conv = nn.Conv2d(in_channels=in_channels,
                               out_channels=conv_filters,
                               kernel_size=kernel_size,
                               padding="same")
@@ -99,18 +144,6 @@ class ConvBlock(nn.Module):
         return self.dropout(x)
 
 
-class CNNLayerNorm(nn.Module):
-    def __init__(self, n_feats):
-        super().__init__()
-        self.layer_norm = nn.LayerNorm(n_feats)
-    def forward(self, x):
-        #x shape: (b, Channels, H[features], W[time])
-        x = x.transpose(dim0=2, dim1=3) 
-        x = self.layer_norm(x) #normalize features
-        return x.transpose(2,3)
-
-
-
 class ConvTransformer(nn.modules.Module):
     """
     """
@@ -118,21 +151,21 @@ class ConvTransformer(nn.modules.Module):
                  X_shape,
                  max_seq_len,
                  n_colors=5,
-                 # multi-head attention
                  #n_embed=32,
                  n_heads=4,
-                 n_layers=4,
-                 dropout=0.0
+                 n_trfmr_layers=4,
+                 trfmr_dropout=0.0,
+                 conv_dropout=0.0
                  ) -> None:
         super().__init__()
         self.n_colors = n_colors
         self.max_seq_len = max_seq_len
         
-        conv_filters = [64, 128, 128]  # filter sizes
-        kernel_size = (3, 3)  # convolution kernel size
-        pool_size = [(4, 4), (8, 8), (4, 4)]  # size of pooling area
+        conv_filters = [64, 256, 128]  # filter sizes, last one = embed_dim if pools are approriately sized
+        kernel_size = (3, 3)  # conv kernel size
+        pool_size = [(4, 4), (8, 8), (4, 4)]  # size of pooling area (4*4*8 = 128, which means C,H,W beomes 128,1,1)
         n_conv_layers = len(conv_filters)    #n of conv layers
-        self.conv_activ = nn.GELU  # activation function to use after each layer
+        conv_activ = nn.GELU  # activ fn for Conv Blocks
         
         # Image input shape = (1, 128, 157)
         if len(X_shape) == 5: #batch, seq_length, C, H, W
@@ -141,31 +174,27 @@ class ConvTransformer(nn.modules.Module):
             assert len(X_shape) == 4
             self.input_shape = X_shape
 
-        seq_len, Channels, H_freq, W_time = self.input_shape
+        seq_len, Channels, H_freq, W_time = self.input_shape #spectrogram input shape
 
         # Initialize layers
-        # Normalize along frequency axis
-        self.ln_1 = CNNLayerNorm(H_freq)
-
+        # Normalize
+        self.ln_0 = nn.LayerNorm([Channels, H_freq, W_time])
 
         # First conv layer
         self.conv_1 = ConvBlock(in_channels=Channels,
                                 conv_filters=conv_filters[0],
                                 kernel_size=kernel_size,
                                 pool_size=pool_size[0],
-                                conv_activ=self.conv_activ,
-                                dropout=dropout
+                                conv_activ=conv_activ,
+                                dropout=conv_dropout
                                 )
 
         # More conv layers
-        self.conv_layers = nn.Sequential(*[
-            ConvBlock(in_channels=conv_filters[i],
-                        conv_filters=conv_filters[i+1],
-                        kernel_size=kernel_size,
-                        pool_size=pool_size[i],
-                        conv_activ=self.conv_activ,
-                        dropout=dropout) \
-            for i in range(n_conv_layers -1)     
+        self.conv_layers = nn.ModuleList([
+            ConvBlock(in_channels=conv_filters[i], conv_filters=conv_filters[i+1],
+                      kernel_size=kernel_size, pool_size=pool_size[i],
+                      conv_activ=conv_activ, dropout=conv_dropout
+                    ) for i in range(n_conv_layers -1)     
         ])
         
         
@@ -176,12 +205,13 @@ class ConvTransformer(nn.modules.Module):
         self.pos_embed = nn.Embedding(num_embeddings=max_seq_len, embedding_dim=self.num_encoded_feats)
 
         # Transformers
-        self.blocks = nn.Sequential(
-            *[TfmrBlock(block_size=max_seq_len, 
-                    in_feats=self.num_encoded_feats, 
-                    n_heads=n_heads, 
-                    dropout=dropout) for _ in range(n_layers)]
-            )
+        self.blocks = nn.ModuleList([
+            TfmrBlock(block_size=max_seq_len, 
+                      in_feats=self.num_encoded_feats, 
+                      n_heads=n_heads, 
+                      dropout=trfmr_dropout
+                      ) for _ in range(n_trfmr_layers)
+            ])
 
         # Classifier / Head
         self.head_ln = nn.LayerNorm(self.num_encoded_feats)
@@ -194,8 +224,8 @@ class ConvTransformer(nn.modules.Module):
         self._special_init_weights()
 
         # --gen model stats--
-        self.n_params = sum([p.numel() for p in self.parameters()])
-        self.n_trainable_params = sum([p.numel() for p in self.parameters() if p.requires_grad])
+        self.n_params = sum(p.numel() for p in self.parameters())
+        self.n_trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
     
 
     @torch.no_grad()
@@ -238,11 +268,18 @@ class ConvTransformer(nn.modules.Module):
     def forward(self, X:torch.tensor, device=torch.device("cuda")):
         # Input: (b, T, 1, 128, 157)
         #      (batch, seq_time, channels, height[n_mels], width[time])
-        batch_size, seq_len, C, H, W = X.shape
+        if len(X.shape) == 5:
+            batch_size, seq_len, C, H, W = X.shape
+        elif len(X.shape) == 4:
+            batch_size = 1
+            seq_len, C, H, W = X.shape
+        else:
+            raise RuntimeError("X.shape is incorrect")
 
         # EMBEDDINGS
-        # Conv Embeddings
-        x = X.reshape(batch_size*seq_len, C, H, W)
+        # Conv Layers for Feature Embeddings
+        x = self.ln_0(X)
+        x = x.reshape(batch_size*seq_len, C, H, W) #treat batch & time as batch-dim
         x = self.conv_1(x)
         x = self.conv_layers(x)
 
@@ -252,7 +289,7 @@ class ConvTransformer(nn.modules.Module):
         pos = torch.tensor([i for i in range(seq_len)]).to(device) #ie, torch.arange(seq_len)
         pos = self.pos_embed(pos)
         x += pos
-        # Shape: (b, T, features])
+        # Shape: (b, T, features)
 
         # Transformer
         x = self.blocks(x)
@@ -264,15 +301,14 @@ class ConvTransformer(nn.modules.Module):
 
         return logits
 
-    # Manual conv "embeddings" produce same output as the reshape method
-    # out = None
-    # for i in range(batch_size):
-    #     x = X[i, :]                               #out: (seq, C, H, W)
-    #     x = self.conv_1(x)
-    #     x = self.conv_layers(x)                     #out: (seq, C, W, H)
+# Manual conv "embeddings" produce same output as the reshape method
+# out = None
+# for i in range(batch_size):
+#     x = X[i, :]                               #out: (seq, C, H, W)
+#     x = self.conv_1(x)
+#     x = self.conv_layers(x)                     #out: (seq, C, W, H)
 
-    #     if out is None:
-    #         out = x
-    #     else:
-    #         out = torch.stack((out, x))
-
+#     if out is None:
+#         out = x
+#     else:
+#         out = torch.stack((out, x))

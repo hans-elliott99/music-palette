@@ -3,7 +3,21 @@ import torch
 import os
 from pathlib import Path
 import json
+import math
 
+
+# MISC ------------------------------------------------------------------------
+def quick_color_display(rgb:list, h=30, w=30):
+    """plt.imshow(quick_color_display([10, 123, 30]))
+    """
+    rgb = [round(v) for v in rgb]
+    block = np.zeros((h, w, 3))
+    block[:,:,:] = rgb
+    return block.astype(np.uint8)
+
+
+
+# METRICS ----------------------------------------------------------------------
 @torch.no_grad()
 def rgb_accuracy(pred_tensor, truth_tensor, window_size, scale_rgb=True):
     assert pred_tensor.size(0) == truth_tensor.size(0)
@@ -46,22 +60,15 @@ def redmean_rgb_dist(pred_tensor:torch.tensor, truth_tensor:torch.tensor, scale_
     return torch.mean( torch.sum(per_palette_loss, axis=1) )
 
 
-def quick_color_display(rgb:list, h=30, w=30):
-    """plt.imshow(quick_color_display([10, 123, 30]))
-    """
-    rgb = [round(v) for v in rgb]
-    block = np.zeros((h, w, 3))
-    block[:,:,:] = rgb
-    return block.astype(np.uint8)
 
  
 
 
-#import colorsys
-#colorsys.rgb_to_hsv
+# TRAINING UTILS --------------------------------------------------------------
 
-
-def save_model_with_shape(model, save_dir, save_name="checkpoint", config_file=None, config=None):
+def save_model_with_shape(model, 
+                          save_dir, save_name="checkpoint", 
+                          config_file=None, config=None):
 
     os.makedirs(save_dir, exist_ok=True)
     save_name = save_name.split(".")[0] + ".pth"
@@ -130,3 +137,20 @@ def load_json(file):
 
 
 
+def lr_decay_cosinewarmup(iter_1_based, max_lr, min_lr=6e-5, warmup_iters=50, decay_iters=50):
+    """https://github.com/karpathy/nanoGPT/blob/master/train.py
+    """
+    # do a linear warmup to max_lr for the first given iters
+    if iter_1_based < warmup_iters:
+        return max_lr * iter_1_based / warmup_iters
+    
+    # return the min. lr if training continues past specified decay iters
+    if (iter_1_based - warmup_iters) > decay_iters:
+        return min_lr
+
+    # otherwise, do a cosine decay down to min-lr    
+    decay_ratio = (iter_1_based - warmup_iters) / (decay_iters - warmup_iters)
+    assert 0 <= decay_ratio <= 1
+    coef = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) #range 0, 1
+    
+    return min_lr + coef * (max_lr - min_lr)
