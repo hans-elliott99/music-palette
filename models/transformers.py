@@ -85,9 +85,9 @@ class ConvBlock(nn.Module):
     def __init__(self, in_channels, conv_filters, kernel_size, pool_size, dropout, conv_activ=nn.GELU) -> None:
         super().__init__()
         self.conv = nn.Conv2d(in_channels=in_channels, #(1 channel)
-                        out_channels=conv_filters,
-                        kernel_size=kernel_size,
-                        padding="same")
+                              out_channels=conv_filters,
+                              kernel_size=kernel_size,
+                              padding="same")
         self.activ = conv_activ()
         self.maxpool = nn.MaxPool2d(kernel_size=pool_size,
                                  stride=pool_size)
@@ -119,18 +119,19 @@ class ConvTransformer(nn.modules.Module):
                  max_seq_len,
                  n_colors=5,
                  # multi-head attention
-                #  n_embed=32,
+                 #n_embed=32,
                  n_heads=4,
                  n_layers=4,
                  dropout=0.0
                  ) -> None:
         super().__init__()
         self.n_colors = n_colors
+        self.max_seq_len = max_seq_len
         
-        conv_filters = [64, 128, 64]  # filter sizes
+        conv_filters = [64, 128, 128]  # filter sizes
         kernel_size = (3, 3)  # convolution kernel size
-        pool_size = [(4, 4), (8, 8), (8, 8)]  # size of pooling area
-        n_layers = len(conv_filters)    #n of conv layers
+        pool_size = [(4, 4), (8, 8), (4, 4)]  # size of pooling area
+        n_conv_layers = len(conv_filters)    #n of conv layers
         self.conv_activ = nn.GELU  # activation function to use after each layer
         
         # Image input shape = (1, 128, 157)
@@ -164,7 +165,7 @@ class ConvTransformer(nn.modules.Module):
                         pool_size=pool_size[i],
                         conv_activ=self.conv_activ,
                         dropout=dropout) \
-            for i in range(n_layers -1)     
+            for i in range(n_conv_layers -1)     
         ])
         
         
@@ -199,7 +200,7 @@ class ConvTransformer(nn.modules.Module):
 
     @torch.no_grad()
     def calc_encoder_output_shape(self):
-        """For ex, if we added/removed conv layers ?
+        """For ex, if we added/removed conv layers
         """
         X = torch.zeros(1, 1, 1, 128, 157) #b, T, C, H[mel], W[time]
         batch_size, seq_len, C, H, W = X.shape
@@ -248,19 +249,20 @@ class ConvTransformer(nn.modules.Module):
         x = x.reshape(batch_size, seq_len, -1)   #(b, T, features)
         
         # Positional Embeddings
-        pos = torch.tensor([i for i in range(seq_len)]).to(device)
+        pos = torch.tensor([i for i in range(seq_len)]).to(device) #ie, torch.arange(seq_len)
         pos = self.pos_embed(pos)
         x += pos
-        # Shape: (b, T, features[512])
+        # Shape: (b, T, features])
 
         # Transformer
         x = self.blocks(x)
+
+        # Head / Classifier
         x = self.head_ln(x)
         x = self.head_dense0(x)
         logits = self.head_sig(x)
 
         return logits
-
 
     # Manual conv "embeddings" produce same output as the reshape method
     # out = None

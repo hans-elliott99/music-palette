@@ -15,3 +15,4 @@ data_*
 checkpoints/
 
 audio_color_mapping.csv
+train_test_songs.json

@@ -100,7 +100,8 @@ def batched_validloop(valid_dataloader, model, criterion, config, device):
     
     return losses, dists, accs
 
-
+#TODO:
+# Read throug MinGPT and snag all those good transformer tricks!
 if __name__=="__main__":
     # User Control
     seed = 87271
@@ -108,11 +109,11 @@ if __name__=="__main__":
     AUDIO_DIR      = "audio_wav"
     SPLITMETA_PATH = "./train_test_songs.json"
     
-    LOG_WANDB              = False
+    LOG_WANDB              = True
 
-    MODEL_SAVE_NAME        = "transformer_1"
+    MODEL_SAVE_NAME        = "transformer_2"
     LOAD_CHECKPOINT        = f"./checkpoints/{MODEL_SAVE_NAME}.pth" #will create if doesnt exist
-    LOAD_CHECKPOINT_CONFIG = f"./checkpoints/{MODEL_SAVE_NAME}.json"
+    LOAD_CHECKPOINT_CONFIG = f"./checkpoints/{MODEL_SAVE_NAME}_config.json"
     SAVE_CHECKPOINT        = True
 
     config = {
@@ -121,18 +122,21 @@ if __name__=="__main__":
         "max_seq_length"  : 5,
         "n_heads"         : 4,
         "n_layers"        : 4,
-        "dropout"         : 0.,
+        "dropout"         : 0.2,
 
         # Training specs
-        "batch_size" : 8,
-        "epochs"     : 100,
+        "batch_size" : 12,
+        "epochs"     : 200,
         "last_epoch" : 0,  #will be overriden by checkpoint if one is loaded
 
         # Optimizer
         "lr" : 3e-4,
+        "betas" : (0.9, 0.999)      
     }
 
     # -------------------------SETUP------------------------- #
+    print(time.strftime("%Y-%m-%d %H:%M"))
+
     use_cuda = torch.cuda.is_available()
     device = "cuda:0" if use_cuda else "cpu"
     torch.cuda.empty_cache()
@@ -154,7 +158,6 @@ if __name__=="__main__":
 
     print("CUDA:", use_cuda)
 
-
     # -------------------------PREPARE DATA------------------------- #
     train_paths, valid_paths, test_paths = dataload.split_samples_by_song(
         arraydata_path=DATA_DIR, 
@@ -163,19 +166,21 @@ if __name__=="__main__":
         valid_share   =0.1,
         random_seed   =seed
         )
-    print("Train Samples:", len(train_paths),
-          "\nValid Samples:", len(valid_paths))
     
     train_dataset = dataload.SeqAudioRgbDataset(paths_list=train_paths,
                                                 max_seq_length=config["max_seq_length"],
                                                 data_dir=DATA_DIR
                                                 )
-                                        
+    train_dataset.remove_short_seqs()
+
     valid_dataset = dataload.SeqAudioRgbDataset(paths_list=valid_paths,
                                                 max_seq_length=config["max_seq_length"],
                                                 data_dir=DATA_DIR
                                                 )
+    valid_dataset.remove_short_seqs()
 
+    print("Train Samples:", len(train_dataset),
+          "\nValid Samples:", len(valid_dataset))
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -222,8 +227,13 @@ if __name__=="__main__":
     model = model.to(device)
     print(f"Model params: {model.n_params :,}")
 
+
+    # -------------------------LOSS & OPTIM------------------------- #
+
     criterion = nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"])
+    optimizer = torch.optim.AdamW(model.parameters(), 
+                                  lr=config["lr"],
+                                  betas=config['betas'])
 
     if LOG_WANDB:
         wandb.watch(model)
@@ -231,9 +241,15 @@ if __name__=="__main__":
     # -------------------------TRAIN LOOP------------------------- #
     ep_losses, ep_dists, ep_accs = [], [], []
     val_losses, val_dists, val_accs = [], [], []
-
+    sched_lr = config['lr']
     try:
         for ep in range(start_epoch, start_epoch+config["epochs"]):
+
+            if ep+1 % 80 == 0:
+                sched_lr /= 10
+                print(f"Decreasing LR to {sched_lr :.2E}")
+                optimizer.param_groups[0]['lr'] = sched_lr
+            
 
             time0 = time.time()
             print(f"\nEPOCH {ep+1} / {start_epoch+config['epochs']}")
@@ -289,6 +305,10 @@ if __name__=="__main__":
             print("Saving.")
         elif i.lower().startswith("n"):
             SAVE_CHECKPOINT = False
+
+    except Exception as e:
+        print("Training error:")
+        print(e)
 
 
 

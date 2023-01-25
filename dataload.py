@@ -197,7 +197,27 @@ class SeqAudioRgbDataset(torch.utils.data.Dataset):
         self.X_transform = X_transform
         self.y_transform = y_transform
         self.do_pad      = pad_short_seqs
+    
+    def remove_short_seqs(self):
+        """What to do with sequences consisting of < max_seq_len clips?
+        Could try to pad them, and then deal with ignoring them in training,
+        or for now, we can just ignore them.
+        """
+        for i, p in enumerate(self.paths_list):
+            with open(self.data_dir / Path(p), "rb") as f:
+                X, y = dill.load(f)
+            if X.shape[0] < self.max_seq_len:
+                self.paths_list.pop(i)
 
+    def _check_for_short_seqs(self):
+        short = 0
+        for p in self.paths_list:
+            with open(self.data_dir / Path(p), "rb") as f:
+                X,_ = dill.load(f)
+            if X.shape[0] < self.max_seq_len:
+                short += 1
+        return short
+        
     def __len__(self):
         return len(self.paths_list)
 
@@ -213,6 +233,7 @@ class SeqAudioRgbDataset(torch.utils.data.Dataset):
         if X.shape[0] < self.max_seq_len and self.do_pad:
             X = self.pad_X(X)
             y = self.pad_y(y)
+
         return X, y
 
     def preprocess_spec(self, X):
