@@ -9,7 +9,7 @@ __pycache__
 
 
 temp/
-audio_wav/
+audio_wav*
 data_*
 *_data
 checkpoints/
