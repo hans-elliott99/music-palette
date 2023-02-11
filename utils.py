@@ -4,7 +4,8 @@ import os
 from pathlib import Path
 import json
 import math
-
+import pandas as pd
+import matplotlib.pyplot as plt
 
 # MISC ------------------------------------------------------------------------
 def quick_color_display(rgb:list, h=30, w=30):
@@ -14,6 +15,28 @@ def quick_color_display(rgb:list, h=30, w=30):
     block = np.zeros((h, w, 3))
     block[:,:,:] = rgb
     return block.astype(np.uint8)
+
+
+def get_audio_color(audio_file:str, audio_color_map_path:str, view=True):
+    audio_file = audio_file.lower().replace("\\", "/")
+    filename = audio_file.split("/")[-1]
+
+    ac = pd.read_csv(audio_color_map_path)
+    colors = []
+    for i in range(ac.shape[1]-1):
+        rgb = ac.loc[ac.audio_clip==filename, f"rgb_clust_{i}"].values[0]
+        rgb = [int(c) for c in rgb.split()]
+        colors.append(rgb)
+    if view:
+        palette = [quick_color_display(col) for col in colors]
+        palette = np.vstack(palette)
+        plt.imshow(palette)
+        plt.axis("off")
+        plt.title(filename)
+        label_step = palette.shape[0] // len(colors)
+        for i in range(len(colors)):
+            plt.text(palette.shape[1]+3, (label_step)*(i+1), str(colors[i]))
+        plt.show()
 
 
 
@@ -154,3 +177,10 @@ def lr_decay_cosinewarmup(iter_1_based, max_lr, min_lr=6e-5, warmup_iters=50, de
     coef = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) #range 0, 1
     
     return min_lr + coef * (max_lr - min_lr)
+
+
+
+if __name__=="__main__":
+
+    for i in range(270, 275):
+        get_audio_color(f"temp/{i}_audioclip_0.wav", "audio_color_mapping.csv")

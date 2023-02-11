@@ -100,25 +100,42 @@ def video_to_data(video:mpe.VideoFileClip, video_id:int, audio_path:str, n_clust
 
 if __name__=="__main__":
 
+    playlist_url = "https://www.youtube.com/playlist?list=PLkqz3S84Tw-SbAumt3O0w1lWQszcFKWDG"
+
     clip_length = 5 ##seconds
     n_clusters  = 5 ##rgb colors per palette
-    temp_path   = "./temp"
-    audio_path  = "./audio_wav"
-    meta_path   = "."
-    playlist    = Playlist("https://www.youtube.com/playlist?list=PLMC9KNkIncKtGvr2kFRuXBVmBev6cAJ2u")
-    merge_all   = True
+    audio_path   = "./audio_wav" ##directory to save downloaded audio files
+    playlist_metadata = "./playlist_strokes_metadata.csv" ##a unique filename to save metadata for the playlist extraction process
+    merge_all = True ##whether to merge extracted audio-color mappings into a single file when extraction process is done
+    temp_path = "./temp" ##directory to temporarily store extracted clip info
+    final_metadata = "./audio_color_mapping.csv"
+    
+    playlist = Playlist(playlist_url)
+
+    # determine song index to start at:
+    start_video_idx = 0
+    if os.path.exists(audio_path):
+        song_ids = set()
+        for fn in os.listdir(audio_path):
+            # read in existing clip filenames and extract song-id
+            song_ids.update([ int(fn.split("_")[0]) ])
+        
+        start_video_idx = max(song_ids) + 1
 
     # create/load playlist metadata to track completed videos and maintain video ids
-    if os.path.isfile(f"{meta_path}/playlist_metadata.csv"):
-        playlist_df = pd.read_csv(f"{meta_path}/playlist_metadata.csv")
+    if os.path.isfile(playlist_metadata):
+        print("Found existing playist metadata at the given filepath. Loading progress and continuing extraction.")
+        playlist_df = pd.read_csv(playlist_metadata)
+
     else:
+        print("Did not find existing playlist metadata at the given filepath. Generating new metadata and starting extraction.")
         playlist_df = pd.DataFrame({
             "url"       : playlist.video_urls,
-            "id"        : range(0, len(playlist.videos)),
+            "video_id"  : range(start_video_idx, start_video_idx+len(playlist.videos)),
             "completed" : [0 for _ in range(len(playlist.videos))],
             "failed"    : [0 for _ in range(len(playlist.videos))]
         })
-        playlist_df.to_csv(f"{meta_path}/playlist_metadata.csv", index = False)
+        playlist_df.to_csv(playlist_metadata, index = False)
 
 
     # Begin extraction process
@@ -126,15 +143,18 @@ if __name__=="__main__":
         
         if df_row['completed'] == 1:
             continue
-        vid_id = df_row['id']
-        url    = df_row['url']
 
+        vid_id = df_row['video_id']
+        url    = df_row['url']
         vid_file = ""
         video    = None
         try:
             vid_file = download_youtube(url, dir=temp_path)
             video = mpe.VideoFileClip(vid_file)
 
+            # Get audio-color mappings 
+            # (produces df which contains the file-name for the song's .WAV 
+            # file and the N rgb colors extracted from the clips)
             output = video_to_data(
                 video, 
                 video_id=vid_id, 
@@ -143,11 +163,12 @@ if __name__=="__main__":
                 clip_length=clip_length,
                 verbose=1
                 )
-            # save output to folder, to be combined at end of playlist processing
+            # save output df to folder to be combined at end of pplaylist extraction
+            # (instead of saving them all in-memory)
             output.to_csv(f"{temp_path}/{vid_id}_md.csv", index=False)
             playlist_df.loc[i, 'completed'] = 1
 
-            # close video and delete file
+            # close video and delete the downloaded mp4
             video.close()
             os.remove(vid_file)
         
@@ -157,19 +178,35 @@ if __name__=="__main__":
 
             if video: video.close()
             if os.path.isfile(vid_file): os.remove(vid_file)
+        
+        except KeyboardInterrupt as e:
+            print("KeyboardInterrupt: Exiting gracefully. Files will not be merged.")
+            merge_all = False
+            break
 
     # save updated metadata            
-    playlist_df.to_csv(f"{meta_path}/playlist_metadata.csv", index = False)
+    playlist_df.to_csv(playlist_metadata, index=False)
 
 
     # merge all output dataframes into one final dataset
     if merge_all:
-        dfs = []
+
+        # check for existing outout df
+        if os.path.exists(final_metadata):
+            print("Existing output metadata found. Appending.")
+            o = pd.read_csv(final_metadata)
+            dfs = [o]
+        else:
+            print(f"No existing output metadata found. Creating new file at: {final_metadata}")
+            dfs = []
+        
         for file in os.listdir(temp_path):
             if not file.endswith("_md.csv"):
                 continue
             dfs.append( pd.read_csv(f"{temp_path}/{file}") )
+        
 
+        # concat and save
         final = pd.concat(dfs)
-        final.to_csv("audio_color_mapping.csv", index=False)
+        final.to_csv(final_metadata, index=False)
 

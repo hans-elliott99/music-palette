@@ -34,7 +34,7 @@ def batched_trainloop(train_dataloader, model, criterion, optimizer, config, dev
         logits_flat = model(X, device) #(b, T, n_colors*3)
         logits_mat = logits_flat.reshape(batch_size, seq_len, model.n_colors, 3) #(b, T, n_colors, rgb[3])
 
-        truth_mat = y[:,:, :model.n_colors]   #(b, T, n_colors, 3)
+        truth_mat = y[:,:, config["color_inds"], :]   #(b, T, n_colors, 3)
         truth_flat = truth_mat.reshape(batch_size, seq_len, -1) #(b, T, n_colors*3)
         loss = criterion(logits_flat, truth_flat)
 
@@ -64,7 +64,6 @@ def batched_trainloop(train_dataloader, model, criterion, optimizer, config, dev
     return losses, dists, accs 
 
 
-
 @torch.no_grad()
 def batched_validloop(valid_dataloader, model, criterion, config, device):
     
@@ -83,7 +82,7 @@ def batched_validloop(valid_dataloader, model, criterion, config, device):
         logits_flat = model(X, device) #(b, T, n_colors*3)
         logits_mat = logits_flat.reshape(batch_size, seq_len, model.n_colors, 3) #(b, T, n_colors, rgb[3])
 
-        truth_mat = y[:,:, :model.n_colors]   #(b, T, n_colors, 3)
+        truth_mat = y[:,:, config["color_inds"], :]   #(b, T, n_colors, 3)
         truth_flat = truth_mat.reshape(batch_size, seq_len, -1)  #(b, T, n_colors*3)
         loss = criterion(logits_flat, truth_flat)
 
@@ -103,40 +102,60 @@ def batched_validloop(valid_dataloader, model, criterion, config, device):
 #TODO:
 # Read throug MinGPT and snag all those good transformer tricks!
 if __name__=="__main__":
-    # User Control
+    # -------------------------USER INPUT------------------------- #
     seed = 87271
     DATA_DIR       = "./data_arrays_seq5"
     AUDIO_DIR      = "audio_wav"
     SPLITMETA_PATH = "./train_test_songs.json"
     
     LOG_WANDB              = True
-
-    MODEL_SAVE_NAME        = "transformer_2"
-    LOAD_CHECKPOINT        = f"./checkpoints/{MODEL_SAVE_NAME}.pth" #will create if doesnt exist
-    LOAD_CHECKPOINT_CONFIG = f"./checkpoints/{MODEL_SAVE_NAME}_config.json"
     SAVE_CHECKPOINT        = True
 
+    MODEL_SAVE_NAME        = "transformer_0"
+    LOAD_CHECKPOINT        = f"./checkpoints/{MODEL_SAVE_NAME}.pth" #will create if doesnt exist
+    LOAD_CHECKPOINT_CONFIG = f"./checkpoints/{MODEL_SAVE_NAME}_config.json"
+
+    epochs = 100
     config = {
-        # Model specs
-        "n_colors"        : 1,
-        "max_seq_length"  : 5,
-        "n_heads"         : 4,
-        "n_layers"        : 4,
-        "dropout"         : 0.2,
+        # MODEL SPECS
+        "max_seq_len"     : 5,
+        "n_colors"        : 3,
+        "n_heads"         : 8,
+        "n_trfmr_layers"  : 8,
+        "embed_dropout"   : 0.0,
+        "trfmr_dropout"   : 0.0,
+        "conv_dropout"    : 0.0,
+        "conv_filters"    : [64, 128, 256, 128, 128],
+        "kernel_size"     : 3,
+        "pool_sizes"      : [(2,2), (2,2), (4,4), (4,4), (4,4)],
+        "conv_activation" : "gelu",
+        "sigmoid_logits"  : False,
 
         # Training specs
-        "batch_size" : 12,
-        "epochs"     : 200,
+        "color_inds" : [0,1,2], #if using < 5 colors, these index the 5-color palette
+        "batch_size" : 10,
+        "epochs"     : epochs,
         "last_epoch" : 0,  #will be overriden by checkpoint if one is loaded
 
-        # Optimizer
-        "lr" : 3e-4,
-        "betas" : (0.9, 0.999)      
+        # Optimizer / LR
+        "lr" : 6e-5, #ie, the max lr if decay_lr==True
+        "betas" : (0.9, 0.999),
+        "decay_lr" : False,
+        "min_lr" : 6e-5, #should be ~= lr / 10
+        "lr_warmup_steps" : epochs // 4,
+        "lr_decay_steps"  : epochs - (epochs//4),
     }
 
-    # -------------------------SETUP------------------------- #
-    print(time.strftime("%Y-%m-%d %H:%M"))
+    required_keys = set(models.ConvTransformer.get_empty_config())
+    assert len(required_keys.intersection(set(config))) == len(required_keys), \
+           f"Missing or mispelled keys in config. Missing={required_keys.difference(set(config))}"
 
+    if config["n_colors"] == 5:
+        config["color_inds"] = [0,1,2,3,4]
+    assert len(config["color_inds"]) == config["n_colors"], \
+           f'Less color_inds ({config["color_inds"]}) provided than n_colors ({config["n_colors"]})'
+
+    # -------------------------SETUP RUN------------------------- #
     use_cuda = torch.cuda.is_available()
     device = "cuda:0" if use_cuda else "cpu"
     torch.cuda.empty_cache()
@@ -156,6 +175,7 @@ if __name__=="__main__":
     random.seed(seed)
     np.random.seed(seed)
 
+    print(time.strftime(r"%Y-%m-%d %H:%M"))
     print("CUDA:", use_cuda)
 
     # -------------------------PREPARE DATA------------------------- #
@@ -168,19 +188,19 @@ if __name__=="__main__":
         )
     
     train_dataset = dataload.SeqAudioRgbDataset(paths_list=train_paths,
-                                                max_seq_length=config["max_seq_length"],
+                                                max_seq_length=config["max_seq_len"],
                                                 data_dir=DATA_DIR
                                                 )
-    train_dataset.remove_short_seqs()
+    train_dataset.remove_short_seqs() ##avoid padding for now, just remove short seqs
 
     valid_dataset = dataload.SeqAudioRgbDataset(paths_list=valid_paths,
-                                                max_seq_length=config["max_seq_length"],
+                                                max_seq_length=config["max_seq_len"],
                                                 data_dir=DATA_DIR
                                                 )
     valid_dataset.remove_short_seqs()
 
-    print("Train Samples:", len(train_dataset),
-          "\nValid Samples:", len(valid_dataset))
+    print("Train Samples:", len(train_dataset), 
+        "\nValid Samples:", len(valid_dataset))
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -208,15 +228,9 @@ if __name__=="__main__":
 
     start_epoch = 0
     if not LOAD_CHECKPOINT or not model_exists:
+        print("Preparing new model.")
         ex_x, _ = train_dataset[0]
-        model = models.ConvTransformer(
-            X_shape=ex_x.shape,
-            max_seq_len=config["max_seq_length"],
-            n_colors=config["n_colors"],
-            n_heads=config["n_heads"],
-            n_layers=config["n_layers"],
-            dropout=config["dropout"]
-        )
+        model = models.ConvTransformer(X_shape=ex_x.shape, config=config)
     else:
         print(f"Loading model checkpoint: {LOAD_CHECKPOINT}")
         model = torch.load(LOAD_CHECKPOINT)
@@ -235,24 +249,31 @@ if __name__=="__main__":
                                   lr=config["lr"],
                                   betas=config['betas'])
 
+    # -------------------------TRAIN LOOP------------------------- #
     if LOG_WANDB:
         wandb.watch(model)
 
-    # -------------------------TRAIN LOOP------------------------- #
     ep_losses, ep_dists, ep_accs = [], [], []
     val_losses, val_dists, val_accs = [], [], []
-    sched_lr = config['lr']
+    lr = config['lr']
+
     try:
         for ep in range(start_epoch, start_epoch+config["epochs"]):
 
-            if ep+1 % 80 == 0:
-                sched_lr /= 10
-                print(f"Decreasing LR to {sched_lr :.2E}")
-                optimizer.param_groups[0]['lr'] = sched_lr
-            
+            if config['decay_lr']:
+                # Update lr: pass in the current iter (1-based), relative
+                # to starting iter. 
+                lr = utils.lr_decay_cosinewarmup(
+                    (ep+1)-start_epoch, 
+                    max_lr=config['lr'],
+                    min_lr=config['min_lr'],
+                    warmup_iters=config['lr_warmup_steps'],
+                    decay_iters=config['lr_decay_steps']
+                    )
+                optimizer.param_groups[0]['lr'] = lr            
 
             time0 = time.time()
-            print(f"\nEPOCH {ep+1} / {start_epoch+config['epochs']}")
+            print(f"\nEPOCH {ep+1} / {start_epoch+config['epochs']} (lr={lr :.3E})")
             
             el, ed, ea = batched_trainloop(train_dataloader, 
                                            model=model, 
@@ -284,17 +305,12 @@ if __name__=="__main__":
             print(f" * Epoch+Valid Time: {stp_time :.1f}s (Est. Train Length = {(stp_time * config['epochs']) / (60*60):.1f} hrs)")
 
             if LOG_WANDB:
-                try:
-                    wandb.log({
-                        "loss"         : el.mean,
-                        "val_loss"     : vl.mean,
-                        "rgb_dist"     : ed.mean,
-                        "val_rgb_dist" : vd.mean,
-                        "acc"          : ea.mean,
-                        "val_acc"      : va.mean
-                    })
-                except Exception as e:
-                    print("[wandb.log error]", e)
+                wandb.log({
+                    "loss"         : el.mean, "val_loss"     : vl.mean,
+                    "rgb_dist"     : ed.mean, "val_rgb_dist" : vd.mean,
+                    "acc"          : ea.mean, "val_acc"      : va.mean,
+                    "lr"           : lr
+                })
         config["last_epoch"] = ep
 
     except KeyboardInterrupt as e:
@@ -307,7 +323,9 @@ if __name__=="__main__":
             SAVE_CHECKPOINT = False
 
     except Exception as e:
-        print("Training error:")
+        # model will be saved if save_checkpoint was set to True at beginning
+        config["last_epoch"] = ep
+        print("*ERROR* Training Interrupted.", "Checkpoint saved." if SAVE_CHECKPOINT else "")
         print(e)
 
 
