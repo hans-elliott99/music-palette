@@ -12,7 +12,7 @@ import torch.nn as nn
 import src.utils as utils
 from src.dataload import SeqAudioRgbDataset, split_samples_by_song
 from src.models.transformers import ConvTransformer
-from src.models.configs import ConvTransformerConfig
+import src.models.configs as configs
 
 
 
@@ -106,8 +106,6 @@ accepted_models = {
 }
 
 
-#TODO:
-# Read throug MinGPT and snag all those good transformer tricks!
 if __name__=="__main__":
     # -------------------------USER INPUT------------------------- #
     seed = 87271
@@ -118,11 +116,13 @@ if __name__=="__main__":
     LOG_WANDB              = True
     SAVE_CHECKPOINT        = True
 
-    MODEL_SAVE_NAME        = "trfmr_highlum"
+    MODEL_SAVE_NAME        = "trfmr_highlum_reg"
     LOAD_CHECKPOINT        = f"./checkpoints/{MODEL_SAVE_NAME}.pth" #will be created if doesnt exist
     LOAD_CHECKPOINT_CONFIG = f"./checkpoints/{MODEL_SAVE_NAME}_config.json"
 
-    MODEL_TYPE = accepted_models[1]
+    MODEL_CLASS  = ConvTransformer
+    MODEL_CONFIG = configs.ConvTrfmrRegularizeConfig
+    DATALOADER   = SeqAudioRgbDataset
 
     epochs = 100
     config = {
@@ -132,25 +132,16 @@ if __name__=="__main__":
         "last_epoch" : 0,  #will be overriden by checkpoint if one is loaded
 
         # Optimizer / LR
-        "lr" : 3e-5, #ie, the max lr if decay_lr==True
+        "lr" : 3e-4, #also the max lr if decay_lr==True
         "betas" : (0.9, 0.999),
-        "decay_lr" : False,
-        "min_lr" : 6e-5, #should be ~= lr / 10
-        "lr_warmup_steps" : epochs // 4,
-        "lr_decay_steps"  : epochs - (epochs//4),
+        "decay_lr" : True,
+        "min_lr" : 6e-5, #should be ~ lr / 10
+        "lr_warmup_steps" : epochs // 5,
+        "lr_decay_steps"  : epochs - (epochs//5),
     }
-
-            
-    if MODEL_TYPE.lower().startswith("conv"):
-        MODEL_CLASS  = ConvTransformer
-        MODEL_CONFIG = ConvTransformerConfig
-        DATALOADER   = SeqAudioRgbDataset
-    else:
-        raise NotImplementedError("Model type not integrated with this training procedure.")
-
     config = { **MODEL_CONFIG().to_dict(), **config }
 
-
+    
     if config["n_colors"] == 1:
         y_transform = utils.pick_highest_luminance
     else:
@@ -272,7 +263,7 @@ if __name__=="__main__":
                     warmup_iters=config['lr_warmup_steps'],
                     decay_iters=config['lr_decay_steps']
                     )
-                optimizer.param_groups[0]['lr'] = lr            
+                optimizer.param_groups[0]['lr'] = lr
 
             time0 = time.time()
             print(f"\nEPOCH {ep+1} / {start_epoch+config['epochs']} (lr={lr :.3E})")

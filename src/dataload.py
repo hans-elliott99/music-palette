@@ -346,9 +346,12 @@ class SeqAudioRgbDataset(torch.utils.data.Dataset):
             X = self.X_transform(X)
 
         # normalize each spectrogram in the sequence to [-1, 1]
-        seq_maxs = np.amax(np.abs(X), axis=(1,2,3)) #maximum along (C, H, W)
-        seq_maxs = seq_maxs.reshape(seq_maxs.shape[0], 1, 1, 1) #(seq_len, C, H, W)
-        X /= seq_maxs
+        # seq_maxs = np.amax(np.abs(X), axis=(1,2,3)) #maximum along (C, H, W)
+        # seq_maxs = seq_maxs.reshape(seq_maxs.shape[0], 1, 1, 1) #(seq_len, C, H, W)
+        # X /= seq_maxs
+        # normalize each spectrogram in the sequence to [-1, 1]
+        for i in range(X.shape[0]): ##seq_length
+            X[i, :] = X[i,:] / np.max(np.abs(X[i,:]))
         return X
 
     def preprocess_pal(self, y):

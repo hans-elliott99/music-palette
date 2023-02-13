@@ -350,7 +350,9 @@ class ConvTransformer(nn.modules.Module):
                  n_heads=4,   #heads per layer
                  n_trfmr_layers=4,
                  embed_dropout=0.0,
-                 trfmr_dropout=0.0,
+                 attn_dropout=0.0,
+                 resid_dropout=0.0,
+                 mlp_dropout=0.0,
                  conv_dropout=0.0,
                  conv_filters=[64, 256, 128],
                  kernel_size=3,
@@ -367,7 +369,9 @@ class ConvTransformer(nn.modules.Module):
             self.n_heads = config.n_heads
             self.n_trfmr_layers = config.n_trfmr_layers
             self.embed_dropout = config.embed_dropout
-            self.trfmr_dropout = config.trfmr_dropout
+            self.attn_dropout = config.attn_dropout
+            self.resid_dropout = config.resid_dropout
+            self.mlp_dropout = config.mlp_dropout
             self.conv_dropout = config.conv_dropout
             self.conv_filters = config.conv_filters
             self.kernel_size = config.kernel_size
@@ -381,7 +385,9 @@ class ConvTransformer(nn.modules.Module):
             self.n_heads = n_heads
             self.n_trfmr_layers = n_trfmr_layers
             self.embed_dropout = embed_dropout
-            self.trfmr_dropout = trfmr_dropout
+            self.attn_dropout = attn_dropout
+            self.resid_dropout = resid_dropout
+            self.mlp_dropout = mlp_dropout
             self.conv_dropout = conv_dropout
             self.conv_filters = conv_filters
             self.kernel_size = kernel_size
@@ -446,9 +452,9 @@ class ConvTransformer(nn.modules.Module):
             TfmrBlock(block_size=self.max_seq_len, 
                       in_feats=self.num_encoded_feats, 
                       n_heads=self.n_heads,
-                      attn_dropout=self.trfmr_dropout,
-                      resid_dropout=self.trfmr_dropout,
-                      mlp_dropout=self.trfmr_dropout,
+                      attn_dropout=self.attn_dropout,
+                      resid_dropout=self.resid_dropout,
+                      mlp_dropout=self.mlp_dropout,
                       ) for _ in range(self.n_trfmr_layers)
             ])
 
@@ -546,23 +552,6 @@ class ConvTransformer(nn.modules.Module):
 
         return logits
 
-    def get_config(self):
-        return dict(
-            max_seq_len = self.max_seq_len,
-            n_colors = self.n_colors,
-            n_heads = self.n_heads,
-            n_trfmr_layers = self.n_trfmr_layers,
-            embed_dropout = self.embed_dropout,
-            trfmr_dropout = self.trfmr_dropout,
-            conv_dropout = self.conv_dropout,
-            conv_filters = self.conv_filters,
-            kernel_size = self.kernel_size,
-            pool_sizes = self.pool_sizes,
-            conv_activation = self.conv_activation,
-            sigmoid_logits = self.sigmoid_logits,
-            n_conv_layers = self.n_conv_layers
-        )
-    
     @staticmethod
     def get_empty_config():
         return dict(
@@ -571,7 +560,9 @@ class ConvTransformer(nn.modules.Module):
             n_heads = None,
             n_trfmr_layers = None,
             embed_dropout = None,
-            trfmr_dropout = None,
+            attn_dropout = None,
+            resid_dropout = None,
+            mlp_dropout = None,
             conv_dropout = None,
             conv_filters = [None],
             kernel_size = None,

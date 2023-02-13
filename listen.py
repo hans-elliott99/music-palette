@@ -1,16 +1,14 @@
 
+from src.utils import quick_color_display
+from src.models.transformers import ConvTransformer
 
 import torch
-from models.transformers import ConvTransformer
-
-import utils
 import numpy as np
+import librosa
+import matplotlib.pyplot as plt
 
 import pyaudio
 import wave
-import librosa
-
-import matplotlib.pyplot as plt
 
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
@@ -18,18 +16,8 @@ CHANNELS = 1
 RATE = 44100
 RECORD_SECONDS = 5 ##model-dependent
 device_index = 0
-model_path = "./checkpoints/transformer_1.pth"
-
-
-@torch.no_grad()
-def rnn_forwardpass_spectrogram(model, spec_array, hidden):
-    logits_flat, hidden = model(spec_array, hidden)
-    return logits_flat, hidden
-
-@torch.no_grad()
-def forwardpass_spectrogram(model, spec_array, device):
-    return model(spec_array)
-
+model_path = "./checkpoints/trfmr_highlum.pth"
+temp_recording = "_temp.wav"
 
 def record_next_clip(pyaudio_stream:pyaudio.Stream, sample_width, wav_filename):
     frames = []
@@ -62,11 +50,14 @@ def convert_to_melspec_tensor(wav_filename,
                                           hop_length=hop_length)
     # convert to log scale (dB scale)
     log_spec = librosa.amplitude_to_db(spec, ref=1.)
-    # normalize to [-1, 1]
-    log_spec /= np.max(np.abs(log_spec)) 
-    log_spec = log_spec[np.newaxis, ...] #add Channel dim
+    #add channel dimension. shape=(Channels[1], Height[features/n_mels], Width[time])
+    log_spec = log_spec[np.newaxis, ...] 
+    return log_spec
 
-    return torch.tensor(log_spec).unsqueeze(0) ##add Batch dim
+def preprocess_spec(log_spec_array):
+    # normalize to [-1, 1]
+    log_spec_array /= np.max(np.abs(log_spec_array)) 
+    return torch.tensor(log_spec_array).unsqueeze(0).unsqueeze(0) # add batch and time dimensions
 
 
 def plot_palette(logits_flat, n_colors):
@@ -78,16 +69,16 @@ def plot_palette(logits_flat, n_colors):
         color = [int(c*255) for c in pal_arr[i].tolist()]
         ax = plt.subplot(n_colors, 1, i+1) ##subplot inds start at 1
         ax.set_title("RGB: " + ', '.join([str(c) for c in color]))
-        ax.imshow(utils.quick_color_display(color))
+        ax.imshow(quick_color_display(color))
 
     plt.show()
 
-def plot_palette_strip(logits_flat, n_colors, melspec=None):
+def plot_palette_with_melspec(logits_flat, n_colors, melspec=None):
     pal_arr = logits_flat.unsqueeze(0).reshape(n_colors,3)
     strip = []
     for i in range(n_colors):
         color = [int(c*255) for c in pal_arr[i].tolist()]
-        strip.append(utils.quick_color_display(color))
+        strip.append(quick_color_display(color))
     strip = np.vstack(strip)
 
     plt.figure()
@@ -107,7 +98,7 @@ if __name__=="__main__":
     # Load in model
     print("loading model")
 
-    model:ConvTransformer = torch.load(model_path, map_location=device)
+    model = torch.load(model_path, map_location=device)
     model = model.to(device)
     model.eval()
 
@@ -116,7 +107,7 @@ if __name__=="__main__":
     # Record audio
     p = pyaudio.PyAudio()
 
-    specs = None
+    spec_sequence = None
     for i in range(10): #while loop
         stream = p.open(rate=RATE, 
                         channels=CHANNELS,
@@ -125,28 +116,30 @@ if __name__=="__main__":
                         input_device_index=device_index)
 
         print("recording...")
-        record_next_clip(stream, p.get_sample_size(FORMAT), "test.wav")
+        record_next_clip(stream, p.get_sample_size(FORMAT), temp_recording)
 
         stream.stop_stream()
         stream.close()
 
         # Convert audio to mel-spec
-        spec_t = convert_to_melspec_tensor("test.wav")
-        spec_t = spec_t.unsqueeze(0) #batch dim
+        spec_t = convert_to_melspec_tensor(temp_recording)
+        spec_t = preprocess_spec(spec_t) #shape (batch[1], time[1], C, H, W)
 
-        if specs is None:
-            specs = spec_t
+        if spec_sequence is None:
+            spec_sequence = spec_t
         else:
-            specs = torch.column_stack((specs[:, -(block_size-1):, :], spec_t)) #keep last (block_size-1) specs and append the new one (on Time dim, 1)
-        specs.to(device)
+            # Keep last (block_size-1) specs and append the new one by stacking
+            # on the time dimension (axis=1 or "column stack")
+            spec_sequence = torch.column_stack( 
+                (spec_sequence[:, -(block_size-1):, :], spec_t) 
+            ) 
         
-        print(specs.shape)
-        # Send through model 
-        # hidden = model.init_hidden(batch_size=1).to(device)
-        # logits_flat, hidden = rnn_forwardpass_spectrogram(model, spec, hidden)
+        spec_sequence.to(device)
+        print(spec_sequence.shape)
 
+        # Send through model 
         with torch.no_grad():
-            logits_flat = model(specs, device)
+            logits_flat = model(spec_sequence)
 
 
         # Do something with the color palette
@@ -154,7 +147,7 @@ if __name__=="__main__":
         ## Let's plot the most recent mel and the most recently generate palette
         mel = spec_t.reshape((128, 157, 1))
         print(logits_flat[:, -1, :] * 255)
-        plot_palette_strip(logits_flat[:, -1, :], model.n_colors, mel)
+        plot_palette_with_melspec(logits_flat[:, -1, :], model.n_colors, mel)
         plt.show()
 
 
