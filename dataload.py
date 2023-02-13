@@ -288,6 +288,8 @@ class SeqAudioRgbDataset(torch.utils.data.Dataset):
     def __init__(self, 
                  paths_list:list,
                  data_dir:str, 
+                 max_seq_length:int,
+                 pad_short_seqs=True,
                  X_transform=None, 
                  y_transform=None,
                  *kwargs
@@ -297,8 +299,8 @@ class SeqAudioRgbDataset(torch.utils.data.Dataset):
         self.paths_list  = paths_list
         self.X_transform = X_transform
         self.y_transform = y_transform
-        self.pad_short_seqs = True
-        self.max_seq_len    = None 
+        self.pad_short_seqs = pad_short_seqs
+        self.max_seq_len    = max_seq_length 
     
     def remove_short_seqs(self):
         """What to do with sequences consisting of < max_seq_len clips?
@@ -339,19 +341,20 @@ class SeqAudioRgbDataset(torch.utils.data.Dataset):
         return X, y
 
     def preprocess_spec(self, X):
-        # normalize each spectrogram in the sequence to [-1, 1]
-        for i in range(X.shape[0]): ##seq_length
-            X[i, :] = X[i,:] / np.max(np.abs(X[i,:]))
 
         if self.X_transform is not None:
             X = self.X_transform(X)
+
+        # normalize each spectrogram in the sequence to [-1, 1]
+        for i in range(X.shape[0]): ##seq_length
+            X[i, :] = X[i,:] / np.max(np.abs(X[i,:]))
         return X
 
     def preprocess_pal(self, y):
         # scale all RGBs to [0,1]
-        y = y.astype(np.float32) / 255.
         if self.y_transform is not None:
             y = self.y_transform(y)
+        y = y.astype(np.float32) / 255.
         return y
     
     def pad_X(self, X):

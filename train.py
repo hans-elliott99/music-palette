@@ -33,7 +33,7 @@ def batched_trainloop(train_dataloader, model, criterion, optimizer, config, dev
         seq_len    = X.shape[1]
 
         # FORWARD PASS
-        logits_flat = model(X, device) #(b, T, n_colors*3)
+        logits_flat = model(X) #(b, T, n_colors*3)
         logits_mat = logits_flat.reshape(batch_size, seq_len, model.n_colors, 3) #(b, T, n_colors, rgb[3])
 
         truth_mat = y[:,:, :model.n_colors, :]   #(b, T, n_colors, 3)
@@ -81,7 +81,7 @@ def batched_validloop(valid_dataloader, model, criterion, config, device):
         seq_len    = X.shape[1]
 
         # FORWARD PASS
-        logits_flat = model(X, device) #(b, T, n_colors*3)
+        logits_flat = model(X) #(b, T, n_colors*3)
         logits_mat = logits_flat.reshape(batch_size, seq_len, model.n_colors, 3) #(b, T, n_colors, rgb[3])
 
         truth_mat = y[:,:, :model.n_colors, :]   #(b, T, n_colors, 3)
@@ -113,7 +113,7 @@ if __name__=="__main__":
     seed = 87271
     DATA_DIR       = "./data_arrays_seq5"
     AUDIO_DIR      = "./data/pop_videos/audio_wav"
-    SPLITMETA_PATH = ".data/pop_videos/train_test_songs.json"
+    SPLITMETA_PATH = "./data/pop_videos/train_test_songs.json"
     
     LOG_WANDB              = False
     SAVE_CHECKPOINT        = True
@@ -149,6 +149,7 @@ if __name__=="__main__":
         raise NotImplementedError("Model type not integrated with this training procedure.")
 
     config = { **MODEL_CONFIG().to_dict(), **config }
+
 
     if config["n_colors"] == 1:
         y_transform = utils.pick_highest_luminance
@@ -190,17 +191,17 @@ if __name__=="__main__":
     
     train_dataset = DATALOADER(paths_list=train_paths,
                                data_dir=DATA_DIR,
+                               max_seq_length=config["max_seq_len"],
                                y_transform=y_transform
                                )
 
     valid_dataset = DATALOADER(paths_list=valid_paths,
                                data_dir=DATA_DIR,
+                               max_seq_length=config["max_seq_len"],
                                y_transform=y_transform
                                )
-    if isinstance(DATALOADER, (SeqAudioRgbDataset)):
-        train_dataset.remove_short_seqs() ##avoid padding for now, just remove short seqs
-        valid_dataset.remove_short_seqs()
-        train_dataset.max_seq_length = config["max_seq_len"]
+    train_dataset.remove_short_seqs() ##avoid padding for now, just remove short seqs
+    valid_dataset.remove_short_seqs()
 
     print("Train Samples:", len(train_dataset), 
         "\nValid Samples:", len(valid_dataset))
@@ -232,7 +233,7 @@ if __name__=="__main__":
     if not LOAD_CHECKPOINT or not model_exists:
         print("Preparing new model.")
         ex_x, _ = train_dataset[0]
-        model = MODEL_CLASS(X_shape=ex_x.shape, config=config)
+        model = MODEL_CLASS(X_shape=ex_x.shape, config=MODEL_CONFIG())
     else:
         print(f"Loading model checkpoint: {LOAD_CHECKPOINT}")
         model = torch.load(LOAD_CHECKPOINT)

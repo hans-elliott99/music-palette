@@ -45,10 +45,10 @@ def pick_highest_luminance(y_array):
     https://en.wikipedia.org/wiki/Relative_luminance
     Returns an array of shape (sequence_length, 1, 3) given (sequence_length, N_colors, 3).
     """
-    y_out = np.zeros((y_array.shape[0], 1, 3)) # seq_len, 1 color, rgb
+    y_out = np.zeros((y_array.shape[0], 1, 3), dtype=np.float32) # seq_len, 1 color, rgb
     lum_coef = np.array([[0.2126], [0.7152], [0.0722]])
     # mat mul w lum coefs to get the highest perceived luminance of all colors in palette (applied per-palette)
-    y_lum = y_array*255 @ lum_coef #5,5,3 @ 3,1 = 5,5,1
+    y_lum = y_array @ lum_coef #5,5,3 @ 3,1 = 5,5,1
     inds = np.argmax(y_lum, axis=1).flatten()
     for i, ix in enumerate(inds):
         y_out[i, :] = y_array[i, ix, :]
