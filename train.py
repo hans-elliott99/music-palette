@@ -11,8 +11,8 @@ import torch.nn as nn
 
 import utils
 from dataload import SeqAudioRgbDataset, SimpleSpecDataset, split_samples_by_song
-from models.transformers import ConvTransformer, SimpleTransformer
-from models.configs import ConvTransformerConfig, SimpleTransformerConfig
+from models.transformers import ConvTransformer
+from models.configs import ConvTransformerConfig
 
 
 
@@ -36,7 +36,7 @@ def batched_trainloop(train_dataloader, model, criterion, optimizer, config, dev
         logits_flat = model(X, device) #(b, T, n_colors*3)
         logits_mat = logits_flat.reshape(batch_size, seq_len, model.n_colors, 3) #(b, T, n_colors, rgb[3])
 
-        truth_mat = y[:,:, config["color_inds"], :]   #(b, T, n_colors, 3)
+        truth_mat = y[:,:, :model.n_colors, :]   #(b, T, n_colors, 3)
         truth_flat = truth_mat.reshape(batch_size, seq_len, -1) #(b, T, n_colors*3)
         loss = criterion(logits_flat, truth_flat)
 
@@ -84,7 +84,7 @@ def batched_validloop(valid_dataloader, model, criterion, config, device):
         logits_flat = model(X, device) #(b, T, n_colors*3)
         logits_mat = logits_flat.reshape(batch_size, seq_len, model.n_colors, 3) #(b, T, n_colors, rgb[3])
 
-        truth_mat = y[:,:, config["color_inds"], :]   #(b, T, n_colors, 3)
+        truth_mat = y[:,:, :model.n_colors, :]   #(b, T, n_colors, 3)
         truth_flat = truth_mat.reshape(batch_size, seq_len, -1)  #(b, T, n_colors*3)
         loss = criterion(logits_flat, truth_flat)
 
@@ -102,8 +102,7 @@ def batched_validloop(valid_dataloader, model, criterion, config, device):
     return losses, dists, accs
 
 accepted_models = {
-    1 : "SimpleTransformer",
-    2 : "ConvTransformer",
+    1 : "ConvTransformer",
 }
 
 
@@ -112,29 +111,28 @@ accepted_models = {
 if __name__=="__main__":
     # -------------------------USER INPUT------------------------- #
     seed = 87271
-    DATA_DIR       = "./data_arrays"
+    DATA_DIR       = "./data_arrays_seq5"
     AUDIO_DIR      = "./data/pop_videos/audio_wav"
     SPLITMETA_PATH = ".data/pop_videos/train_test_songs.json"
     
     LOG_WANDB              = False
     SAVE_CHECKPOINT        = True
 
-    MODEL_SAVE_NAME        = "simple_trfmr"
+    MODEL_SAVE_NAME        = "trfmr_highlum"
     LOAD_CHECKPOINT        = f"./checkpoints/{MODEL_SAVE_NAME}.pth" #will be created if doesnt exist
     LOAD_CHECKPOINT_CONFIG = f"./checkpoints/{MODEL_SAVE_NAME}_config.json"
 
-    MODEL_TYPE = accepted_models[1] #SimpleTransformer, ConvTransformer
+    MODEL_TYPE = accepted_models[1]
 
     epochs = 100
     config = {
         # Training specs
-        "color_inds" : [0,1,2], #if using < 5 colors, these index the 5-color palette
         "batch_size" : 10,
         "epochs"     : epochs,
         "last_epoch" : 0,  #will be overriden by checkpoint if one is loaded
 
         # Optimizer / LR
-        "lr" : 6e-5, #ie, the max lr if decay_lr==True
+        "lr" : 3e-5, #ie, the max lr if decay_lr==True
         "betas" : (0.9, 0.999),
         "decay_lr" : False,
         "min_lr" : 6e-5, #should be ~= lr / 10
@@ -143,11 +141,7 @@ if __name__=="__main__":
     }
 
             
-    if MODEL_TYPE.lower().startswith("simple"):
-        MODEL_CLASS  = SimpleTransformer
-        MODEL_CONFIG = SimpleTransformerConfig
-        DATALOADER   = SimpleSpecDataset
-    elif MODEL_TYPE.lower().startswith("conv"):
+    if MODEL_TYPE.lower().startswith("conv"):
         MODEL_CLASS  = ConvTransformer
         MODEL_CONFIG = ConvTransformerConfig
         DATALOADER   = SeqAudioRgbDataset
@@ -156,10 +150,10 @@ if __name__=="__main__":
 
     config = { **MODEL_CONFIG().to_dict(), **config }
 
-    if config["n_colors"] == 5:
-        config["color_inds"] = [0,1,2,3,4]
-    assert len(config["color_inds"]) == config["n_colors"], \
-           f'Less color_inds ({config["color_inds"]}) provided than n_colors ({config["n_colors"]})'
+    if config["n_colors"] == 1:
+        y_transform = utils.pick_highest_luminance
+    else:
+        y_transform = None
 
     # -------------------------SETUP RUN------------------------- #
     use_cuda = torch.cuda.is_available()
@@ -195,11 +189,13 @@ if __name__=="__main__":
     )
     
     train_dataset = DATALOADER(paths_list=train_paths,
-                               data_dir=DATA_DIR
+                               data_dir=DATA_DIR,
+                               y_transform=y_transform
                                )
 
     valid_dataset = DATALOADER(paths_list=valid_paths,
-                               data_dir=DATA_DIR
+                               data_dir=DATA_DIR,
+                               y_transform=y_transform
                                )
     if isinstance(DATALOADER, (SeqAudioRgbDataset)):
         train_dataset.remove_short_seqs() ##avoid padding for now, just remove short seqs

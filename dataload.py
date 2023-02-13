@@ -141,6 +141,7 @@ def generate_seq_data_arrays(metadata_path,
             if i % verbosity == 0:
                 print(f"[et={time.time()-t0 :.2f}s]",
                     f"Songs converted: {i+1} / {len(samples.groups)} ({(i+1)*100 / len(samples.groups) :.2f}%)")
+    print(f"Final songs converted: {i+1}")
 
 
 def generate_data_arrays(metadata_path,
@@ -376,10 +377,11 @@ class SeqAudioRgbDataset(torch.utils.data.Dataset):
 
 # if __name__=="__main__":
 
-    # generate_data_arrays(
-    #     metadata_path="./data/pop_videos/audio_color_mapping.csv",
-    #     audio_folder="./data/pop_videos/audio_wav",
-    #     save_folder="./data_arrays",
-    #     remake_existing=False,
-    #     verbosity=100
-    # )
+#     generate_seq_data_arrays(
+#         metadata_path="./data/pop_videos/audio_color_mapping.csv",
+#         audio_folder="./data/pop_videos/audio_wav",
+#         save_folder="./data_arrays",
+#         max_seq_length=5,
+#         remake_existing=False,
+#         verbosity=100
+#     )

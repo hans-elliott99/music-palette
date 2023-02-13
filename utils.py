@@ -38,7 +38,21 @@ def get_audio_color(audio_file:str, audio_color_map_path:str, view=True):
             plt.text(palette.shape[1]+3, (label_step)*(i+1), str(colors[i]))
         plt.show()
 
-
+def pick_highest_luminance(y_array):
+    """Calculates which RGB color has the highest perceived luminance.
+    Selects (for each palette in a provided sequence) which color has the highest perceived luminance
+    using the simple relative luminance formula as seen here:
+    https://en.wikipedia.org/wiki/Relative_luminance
+    Returns an array of shape (sequence_length, 1, 3) given (sequence_length, N_colors, 3).
+    """
+    y_out = np.zeros((y_array.shape[0], 1, 3)) # seq_len, 1 color, rgb
+    lum_coef = np.array([[0.2126], [0.7152], [0.0722]])
+    # mat mul w lum coefs to get the highest perceived luminance of all colors in palette (applied per-palette)
+    y_lum = y_array*255 @ lum_coef #5,5,3 @ 3,1 = 5,5,1
+    inds = np.argmax(y_lum, axis=1).flatten()
+    for i, ix in enumerate(inds):
+        y_out[i, :] = y_array[i, ix, :]
+    return y_out
 
 # METRICS ----------------------------------------------------------------------
 @torch.no_grad()
