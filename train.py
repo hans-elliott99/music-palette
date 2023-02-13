@@ -9,10 +9,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import utils
-from dataload import SeqAudioRgbDataset, SimpleSpecDataset, split_samples_by_song
-from models.transformers import ConvTransformer
-from models.configs import ConvTransformerConfig
+import src.utils as utils
+from src.dataload import SeqAudioRgbDataset, split_samples_by_song
+from src.models.transformers import ConvTransformer
+from src.models.configs import ConvTransformerConfig
 
 
 
@@ -115,7 +115,7 @@ if __name__=="__main__":
     AUDIO_DIR      = "./data/pop_videos/audio_wav"
     SPLITMETA_PATH = "./data/pop_videos/train_test_songs.json"
     
-    LOG_WANDB              = False
+    LOG_WANDB              = True
     SAVE_CHECKPOINT        = True
 
     MODEL_SAVE_NAME        = "trfmr_highlum"
