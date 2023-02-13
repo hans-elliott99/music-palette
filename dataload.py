@@ -47,7 +47,7 @@ class AudioDataManager:
         self.train_songs = songs[:idx]
         self.valid_songs = songs[idx:]
 
-
+# Generating Data for Processing Sequences of Multiple Spectorgrams ----------- 
 def break_song_into_samples(x, max_seq_len=10):
     x.reset_index(inplace=True, drop=True)
     n_splits = math.ceil(x.shape[0] / max_seq_len)
@@ -143,11 +143,65 @@ def generate_seq_data_arrays(metadata_path,
                     f"Songs converted: {i+1} / {len(samples.groups)} ({(i+1)*100 / len(samples.groups) :.2f}%)")
 
 
+def generate_data_arrays(metadata_path,
+                         audio_folder,
+                         save_folder  = "./data_arrays",
+                         remake_existing = True,
+                         #librosa:
+                         sample_rate = 16000, ##to load audio as
+                         n_mels      = 128,   ##number of Mel bands to generate
+                         n_fft       = 2048,  ##length of the FFT window
+                         hop_length  = 512,   ##number of samples between successive frames
+                         verbosity   = 100):
+    """Iterrate through saved WAV files and their corresponding color palettes and save as tuples of np arrays.
+    """
+
+    os.makedirs(save_folder, exist_ok=True)
+    meta = pd.read_csv(metadata_path)
+
+    t0 = time.time()
+    for i, row in meta.iterrows():
+        wav_file = row["audio_clip"]
+        save_path = Path(save_folder) / Path(wav_file.split(".")[0])
+        if save_path.exists() and not remake_existing:
+            continue
+        wav_path = Path(audio_folder) / Path(wav_file)
+
+        # create mel-spectorgram
+        y, sr = librosa.load(wav_path, sr=sample_rate)
+        spec = librosa.feature.melspectrogram(y=y, sr=sr,
+                                            n_mels=n_mels, 
+                                            n_fft=n_fft,
+                                            hop_length=hop_length)
+        # convert to log scale (dB scale)
+        log_spec = librosa.amplitude_to_db(spec, ref=1.)
+        log_spec = log_spec[np.newaxis, ...] #add Channel dim
+
+        # convert color palette to np array
+        pal = []
+        for k in row.keys():
+            if k.startswith("rgb"):
+                rgb = [int(c) for c in row[k].split()]
+                pal.append(rgb)
+        pal = np.array(pal)
+
+
+        data = (log_spec, pal)
+        # save
+        with open(save_path, 'wb') as f:
+            dill.dump(data, f)
+        
+        # print progress
+        if verbosity > 0:
+            if i % verbosity == 0:
+                print(f"[et={time.time()-t0 :.2f}s]",
+                    f"Clips converted: {i+1} / {meta.shape[0]} ({(i+1)*100 / meta.shape[0] :.2f}%)")
+
 
     
 
-def split_samples_by_song(arraydata_path, 
-                          audio_path="./audio_wav", 
+def split_samples_by_song(arraydata_dir, 
+                          audio_dir="./audio_wav", 
                           splitmeta_path="./meta.json",
                           valid_share=0.1,
                           test_share=None,
@@ -163,10 +217,13 @@ def split_samples_by_song(arraydata_path,
     For each split (train, valid, test), returns a list of the filenames within
     "arraydata_path" which belong to the split.
     """
-    a = AudioDataManager(audio_path)
+    a = AudioDataManager(audio_dir)
+
+    assert splitmeta_path.split(".")[-1] == "json"
     if not os.path.exists(splitmeta_path):
         assert test_share is not None, "Test-share is a required arg if creating new train-test splits."
         print("Creating new train-test split. Saving song-ids to:", splitmeta_path)
+
         a.create_song_splits(test_share=test_share, 
                              metadata_path=splitmeta_path,
                              random_seed=random_seed)
@@ -174,7 +231,7 @@ def split_samples_by_song(arraydata_path,
     a.load_song_splits(splitmeta_path)
     a.make_valid_split(valid_share, random_seed=random_seed)
     
-    data_files = os.listdir(arraydata_path)
+    data_files = os.listdir(arraydata_dir)
     train_paths = [f for f in data_files if int(f.split("_")[0]) in a.train_songs]
     valid_paths = [f for f in data_files if int(f.split("_")[0]) in a.valid_songs]
     test_paths  = [f for f in data_files if int(f.split("_")[0]) in a.test_songs]
@@ -182,21 +239,65 @@ def split_samples_by_song(arraydata_path,
     return train_paths, valid_paths, test_paths
 
 
+
+class SimpleSpecDataset(torch.utils.data.Dataset):
+    def __init__(self,
+                 paths_list,
+                 data_dir,
+                 X_transform=None,
+                 y_transform=None
+                 ) -> None:
+        super().__init__()
+        self.paths_list = paths_list
+        self.data_dir = Path(data_dir)
+        self.X_transform = X_transform
+        self.y_transform = y_transform
+
+    def __len__(self):
+        return len(self.paths_list)
+
+    def __getitem__(self, idx):
+        p = self.data_dir / Path(self.paths_list[idx])
+
+        with open(p, "rb") as f:
+            X, y = dill.load(f)
+
+        X = torch.tensor(self.preprocess_spec(X))
+        y = torch.tensor(self.preprocess_pal(y))
+        return X, y
+
+    def preprocess_spec(self, X):
+        # normalize spectrogram to [-1, 1]
+        X /= np.amax(np.abs(X))
+        if self.X_transform is not None:
+            X = self.X_transform(X)
+        return X
+
+    def preprocess_pal(self, y):
+        # scale all RGBs to [0,1]
+        y = y.astype(np.float32) / 255.0
+        if self.y_transform is not None:
+            y = self.y_transform(y)
+        return y
+
+
+
+
 class SeqAudioRgbDataset(torch.utils.data.Dataset):
     def __init__(self, 
                  paths_list:list,
                  data_dir:str, 
-                 max_seq_length:int, 
-                 pad_short_seqs=True,
                  X_transform=None, 
-                 y_transform=None) -> None:
+                 y_transform=None,
+                 *kwargs
+                 ) -> None:
         super().__init__()
         self.data_dir    = Path(data_dir)
         self.paths_list  = paths_list
-        self.max_seq_len = max_seq_length
         self.X_transform = X_transform
         self.y_transform = y_transform
-        self.do_pad      = pad_short_seqs
+        self.pad_short_seqs = True
+        self.max_seq_len    = None 
     
     def remove_short_seqs(self):
         """What to do with sequences consisting of < max_seq_len clips?
@@ -230,7 +331,7 @@ class SeqAudioRgbDataset(torch.utils.data.Dataset):
         X = torch.tensor(self.preprocess_spec(X))
         y = torch.tensor(self.preprocess_pal(y))
 
-        if X.shape[0] < self.max_seq_len and self.do_pad:
+        if X.shape[0] < self.max_seq_len and self.pad_short_seqs:
             X = self.pad_X(X)
             y = self.pad_y(y)
 
@@ -275,11 +376,10 @@ class SeqAudioRgbDataset(torch.utils.data.Dataset):
 
 # if __name__=="__main__":
 
-#     generate_seq_data_arrays(
-#         metadata_path="./audio_color_mapping.csv",
-#         audio_folder="./audio_wav",
-#         save_folder="./data_arrays",
-#         max_seq_length=5,
-#         remake_existing=False,
-#         verbosity=100
-#     )
+    # generate_data_arrays(
+    #     metadata_path="./data/pop_videos/audio_color_mapping.csv",
+    #     audio_folder="./data/pop_videos/audio_wav",
+    #     save_folder="./data_arrays",
+    #     remake_existing=False,
+    #     verbosity=100
+    # )
