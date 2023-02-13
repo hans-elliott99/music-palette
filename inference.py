@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import torch
 import utils
 import dataload
-import models.models_rnn as models_rnn
+import old.models_rnn as models_rnn
 
 
 def load_prep_model(model_path):
