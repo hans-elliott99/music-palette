@@ -8,9 +8,11 @@ from dotenv import dotenv_values
 import numpy as np
 import torch
 import torch.nn as nn
-import models.transformers as models
+
 import utils
-import dataload
+from dataload import SeqAudioRgbDataset, SimpleSpecDataset, split_samples_by_song
+from models.transformers import ConvTransformer, SimpleTransformer
+from models.configs import ConvTransformerConfig, SimpleTransformerConfig
 
 
 
@@ -99,38 +101,32 @@ def batched_validloop(valid_dataloader, model, criterion, config, device):
     
     return losses, dists, accs
 
+accepted_models = {
+    1 : "SimpleTransformer",
+    2 : "ConvTransformer",
+}
+
+
 #TODO:
 # Read throug MinGPT and snag all those good transformer tricks!
 if __name__=="__main__":
     # -------------------------USER INPUT------------------------- #
     seed = 87271
-    DATA_DIR       = "./data_arrays_seq5"
-    AUDIO_DIR      = "audio_wav"
-    SPLITMETA_PATH = "./train_test_songs.json"
+    DATA_DIR       = "./data_arrays"
+    AUDIO_DIR      = "./data/pop_videos/audio_wav"
+    SPLITMETA_PATH = ".data/pop_videos/train_test_songs.json"
     
-    LOG_WANDB              = True
+    LOG_WANDB              = False
     SAVE_CHECKPOINT        = True
 
-    MODEL_SAVE_NAME        = "transformer_0"
-    LOAD_CHECKPOINT        = f"./checkpoints/{MODEL_SAVE_NAME}.pth" #will create if doesnt exist
+    MODEL_SAVE_NAME        = "simple_trfmr"
+    LOAD_CHECKPOINT        = f"./checkpoints/{MODEL_SAVE_NAME}.pth" #will be created if doesnt exist
     LOAD_CHECKPOINT_CONFIG = f"./checkpoints/{MODEL_SAVE_NAME}_config.json"
+
+    MODEL_TYPE = accepted_models[1] #SimpleTransformer, ConvTransformer
 
     epochs = 100
     config = {
-        # MODEL SPECS
-        "max_seq_len"     : 5,
-        "n_colors"        : 3,
-        "n_heads"         : 8,
-        "n_trfmr_layers"  : 8,
-        "embed_dropout"   : 0.0,
-        "trfmr_dropout"   : 0.0,
-        "conv_dropout"    : 0.0,
-        "conv_filters"    : [64, 128, 256, 128, 128],
-        "kernel_size"     : 3,
-        "pool_sizes"      : [(2,2), (2,2), (4,4), (4,4), (4,4)],
-        "conv_activation" : "gelu",
-        "sigmoid_logits"  : False,
-
         # Training specs
         "color_inds" : [0,1,2], #if using < 5 colors, these index the 5-color palette
         "batch_size" : 10,
@@ -146,9 +142,19 @@ if __name__=="__main__":
         "lr_decay_steps"  : epochs - (epochs//4),
     }
 
-    required_keys = set(models.ConvTransformer.get_empty_config())
-    assert len(required_keys.intersection(set(config))) == len(required_keys), \
-           f"Missing or mispelled keys in config. Missing={required_keys.difference(set(config))}"
+            
+    if MODEL_TYPE.lower().startswith("simple"):
+        MODEL_CLASS  = SimpleTransformer
+        MODEL_CONFIG = SimpleTransformerConfig
+        DATALOADER   = SimpleSpecDataset
+    elif MODEL_TYPE.lower().startswith("conv"):
+        MODEL_CLASS  = ConvTransformer
+        MODEL_CONFIG = ConvTransformerConfig
+        DATALOADER   = SeqAudioRgbDataset
+    else:
+        raise NotImplementedError("Model type not integrated with this training procedure.")
+
+    config = { **MODEL_CONFIG().to_dict(), **config }
 
     if config["n_colors"] == 5:
         config["color_inds"] = [0,1,2,3,4]
@@ -179,25 +185,26 @@ if __name__=="__main__":
     print("CUDA:", use_cuda)
 
     # -------------------------PREPARE DATA------------------------- #
-    train_paths, valid_paths, test_paths = dataload.split_samples_by_song(
-        arraydata_path=DATA_DIR, 
-        audio_path    =AUDIO_DIR,
+    train_paths, valid_paths, test_paths = split_samples_by_song(
+        arraydata_dir =DATA_DIR, 
+        audio_dir     =AUDIO_DIR,
         splitmeta_path=SPLITMETA_PATH,
         valid_share   =0.1,
+        test_share    =0.2,
         random_seed   =seed
-        )
+    )
     
-    train_dataset = dataload.SeqAudioRgbDataset(paths_list=train_paths,
-                                                max_seq_length=config["max_seq_len"],
-                                                data_dir=DATA_DIR
-                                                )
-    train_dataset.remove_short_seqs() ##avoid padding for now, just remove short seqs
+    train_dataset = DATALOADER(paths_list=train_paths,
+                               data_dir=DATA_DIR
+                               )
 
-    valid_dataset = dataload.SeqAudioRgbDataset(paths_list=valid_paths,
-                                                max_seq_length=config["max_seq_len"],
-                                                data_dir=DATA_DIR
-                                                )
-    valid_dataset.remove_short_seqs()
+    valid_dataset = DATALOADER(paths_list=valid_paths,
+                               data_dir=DATA_DIR
+                               )
+    if isinstance(DATALOADER, (SeqAudioRgbDataset)):
+        train_dataset.remove_short_seqs() ##avoid padding for now, just remove short seqs
+        valid_dataset.remove_short_seqs()
+        train_dataset.max_seq_length = config["max_seq_len"]
 
     print("Train Samples:", len(train_dataset), 
         "\nValid Samples:", len(valid_dataset))
@@ -222,15 +229,14 @@ if __name__=="__main__":
 
     # -------------------------PREPARE MODEL------------------------- #
     model_exists = False
-    if LOAD_CHECKPOINT is not None:
-        if os.path.exists(LOAD_CHECKPOINT):
-            model_exists = True
+    if LOAD_CHECKPOINT is not None and os.path.exists(LOAD_CHECKPOINT):
+        model_exists = True
 
     start_epoch = 0
     if not LOAD_CHECKPOINT or not model_exists:
         print("Preparing new model.")
         ex_x, _ = train_dataset[0]
-        model = models.ConvTransformer(X_shape=ex_x.shape, config=config)
+        model = MODEL_CLASS(X_shape=ex_x.shape, config=config)
     else:
         print(f"Loading model checkpoint: {LOAD_CHECKPOINT}")
         model = torch.load(LOAD_CHECKPOINT)
@@ -243,7 +249,6 @@ if __name__=="__main__":
 
 
     # -------------------------LOSS & OPTIM------------------------- #
-
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), 
                                   lr=config["lr"],
@@ -331,7 +336,7 @@ if __name__=="__main__":
 
 
     # Save metrics for analysis
-    log = utils.JsonLog("./checkpoints/metricslog.json")
+    log = utils.JsonLog(f"./checkpoints/{MODEL_SAVE_NAME}_metricslog.json")
     log.write(train_loss=ep_losses, train_rgbdist=ep_dists, train_acc=ep_accs,
               val_loss=val_losses, val_rgbdists=val_dists, val_acc=val_accs)
     
