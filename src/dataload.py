@@ -304,21 +304,24 @@ class SeqAudioRgbDataset(torch.utils.data.Dataset):
     
     def remove_short_seqs(self):
         """What to do with sequences consisting of < max_seq_len clips?
-        Could try to pad them, and then deal with ignoring them in training,
-        or for now, we can just ignore them.
+        Could try to pad them, and then deal with ignoring them in backprop,
+        or for now, we can just remove them.
         """
+        final_paths = [] 
         for i, p in enumerate(self.paths_list):
             with open(self.data_dir / Path(p), "rb") as f:
                 X, y = dill.load(f)
-            if X.shape[0] < self.max_seq_len:
-                self.paths_list.pop(i)
+            if X.shape[0] == self.max_seq_len:
+                final_paths.append(p)
+        self.paths_list = final_paths
+        
 
     def _check_for_short_seqs(self):
         short = 0
         for p in self.paths_list:
             with open(self.data_dir / Path(p), "rb") as f:
                 X,_ = dill.load(f)
-            if X.shape[0] < self.max_seq_len:
+            if X.shape[0] != self.max_seq_len:
                 short += 1
         return short
         
@@ -346,12 +349,11 @@ class SeqAudioRgbDataset(torch.utils.data.Dataset):
             X = self.X_transform(X)
 
         # normalize each spectrogram in the sequence to [-1, 1]
-        # seq_maxs = np.amax(np.abs(X), axis=(1,2,3)) #maximum along (C, H, W)
-        # seq_maxs = seq_maxs.reshape(seq_maxs.shape[0], 1, 1, 1) #(seq_len, C, H, W)
-        # X /= seq_maxs
-        # normalize each spectrogram in the sequence to [-1, 1]
-        for i in range(X.shape[0]): ##seq_length
-            X[i, :] = X[i,:] / np.max(np.abs(X[i,:]))
+        seq_maxs = np.amax(np.abs(X), axis=(1,2,3)) #maximum along (C, H, W)
+        seq_maxs = seq_maxs.reshape(seq_maxs.shape[0], 1, 1, 1) #(seq_len, C, H, W)
+        X /= seq_maxs
+        # for i in range(X.shape[0]): ##seq_length
+        #     X[i, :] = X[i,:] / np.max(np.abs(X[i,:]))
         return X
 
     def preprocess_pal(self, y):
