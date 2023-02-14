@@ -16,7 +16,7 @@ CHANNELS = 1
 RATE = 44100
 RECORD_SECONDS = 5 ##model-dependent
 device_index = 0
-model_path = "./checkpoints/trfmr_highlum.pth"
+model_path = "./checkpoints/trfmr_reg_highlum.pth"
 temp_recording = "_temp.wav"
 
 def record_next_clip(pyaudio_stream:pyaudio.Stream, sample_width, wav_filename):

@@ -3,6 +3,7 @@ import random
 import os
 from pathlib import Path
 import dill
+import numpy as np
 import matplotlib.pyplot as plt
 
 import torch
@@ -48,16 +49,34 @@ def batched_testloop(test_dataloader, model, criterion, device):
     return losses, dists, accs
 
 @torch.no_grad()
-def forward_example():
-    pass
+def forward_example(X, y, model):
+    model.eval()
+    batch_size = X.shape[0] #==1
+    seq_len    = X.shape[1]
 
+    # FORWARD PASS
+    logits_flat = model(X) #(b, T, n_colors*3)
+    logits_mat = logits_flat.reshape(batch_size, seq_len, model.n_colors, 3) #(b, T, n_colors, rgb[3])
 
+    truth_mat = y[:,:, :model.n_colors, :]   #(b, T, n_colors, 3)
+    truth_flat = truth_mat.reshape(batch_size, seq_len, -1)  #(b, T, n_colors*3)
+    loss = torch.nn.functional.mse_loss(logits_flat, truth_flat)
+
+    # Calc metrics
+    rgb_dist, rgb_acc = 0, 0
+    for i in range(seq_len):
+        rgb_dist += utils.redmean_rgb_dist(logits_mat[:, i, :], truth_mat[:, i, :], scale_rgb=True)
+        rgb_acc  += utils.rgb_accuracy(logits_mat[:, i, :], truth_mat[:, i, :], scale_rgb=True, window_size=10)
+
+    return logits_mat, loss.item(), rgb_dist.item(), rgb_acc
+
+# ----------------------------------------------------------------------------------------
 def plot_pred_true_palettes(truth_arr, pred_arr):
     assert len(truth_arr.shape) == 2
     assert len(pred_arr.shape) == 2
     n_colors = pred_arr.shape[0]
 
-    fig, axes = plt.subplots(n_colors, 2, figsize=(8,5))
+    fig, axes = plt.subplots(n_colors+1, 2, figsize=(8,5))
     plt.subplots_adjust(hspace=0.5)
 
     fig.suptitle("True Color | Predicted Color")
@@ -66,26 +85,28 @@ def plot_pred_true_palettes(truth_arr, pred_arr):
         pred_col = [int(c*255) for c in pred_arr[i].tolist()]
 
         ax1, ax2 = axes[i, 0], axes[i, 1]
-        # ax1 = plt.subplot(n_colors, 2, i+1) ##subplot inds start at 1
         ax1.set_title("True RGB: " + ', '.join([str(c) for c in true_col]))
         ax1.imshow(utils.quick_color_display(true_col))
 
-        # ax2 = plt.subplot(n_colors, 2, i+2)
         ax2.set_title("Pred RGB: " + ', '.join([str(c) for c in pred_col]))
         ax2.imshow(utils.quick_color_display(pred_col))
-
-    
     plt.show()
 
-
-
+def plot_melspec_seq(X):
+    if len(X.shape) == 5:
+        X = X.squeeze(0) #rm batch dim
+    
+    o = np.concatenate(np.array(X.cpu()), axis=1).squeeze(0) #concatenate on the height dimension
+    o = o[..., np.newaxis] #channel dim must be last
+    plt.imshow(o)
+    plt.show()
 
 if __name__=="__main__":
     
     device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     print("device:",device)
 
-    model_path = "./checkpoints/trfmr_highlum.pth"
+    model_path = "./checkpoints/trfmr_reg_highlum.pth"
     model = torch.load(model_path)
     model = model.to(device)
 
@@ -112,59 +133,31 @@ if __name__=="__main__":
     )
 
 
-    loss, dist, acc = batched_testloop(
-        test_dataloader, model,
-        criterion=torch.nn.MSELoss(),
-        device=device
-    )
-
-
-    print(
-        "Test Performance:"
-        f"\nMean Loss = {loss.mean :.5f}"
-        f"\nMean RGB Dist = {dist.mean :.5f}"
-        f"\nMean RGB Acc = {acc.mean :.5f}"
-    )
-    # X, y = test_dataset[ random.randint(0, len(test_dataset)-1) ]
-    # X = X.unsqueeze(0).to(device)
-    # y = y.unsqueeze(0).to(device) #unsqueeze to add batch dimension
-    # metrics, preds = forwardpass_sequence(model, X, y, device)
+    if False: #test the entire hold-out data
+        loss, dist, acc = batched_testloop(
+            test_dataloader, model,
+            criterion=torch.nn.MSELoss(),
+            device=device
+        )
+        print(
+            "Test Performance:"
+            f"\n\tMean Loss = {loss.mean :.5f}"
+            f"\n\tMean RGB Dist = {dist.mean :.5f}"
+            f"\n\tMean RGB Acc = {acc.mean :.5f}"
+        )
     
+    # test a random example
+    X, y = test_dataset[ random.randint(0, len(test_dataset)-1) ]
+    X = X.unsqueeze(0).to(device)
+    y = y.unsqueeze(0).to(device) #unsqueeze to add batch dimension
+    preds, loss, rgb_dist, rgb_acc = forward_example(X, y, model)
 
 
-    # for i in range(preds.shape[1]): #sequence 
-    #     plot_pred_true_palettes(y[0, i, :], preds[0, i, :])
+    print(preds*255)
+    print(f"Test example loss = {loss}")
+    print(f"Test example RGB Dist = {rgb_dist}")
+    print(f"Test example RGB Accuracy = {rgb_acc}")
 
-
-
-
-# @torch.no_grad()
-# def rnn_forwardpass_sequence(model, X, y, device):
-
-#     criterion = torch.nn.MSELoss()
-#     loss = 0
-#     rgb_dist = 0
-#     rgb_acc = 0
-#     preds = []
-
-#     seq_iters = X.shape[1]
-#     h0 = model.init_hidden(batch_size=1).to(device)
-#     for s in range(seq_iters):
-#             x_s = X[:, s, :]
-#             logits_flat, h0 = model(x_s, h0)
-#             logits_mat = logits_flat.reshape(logits_flat.shape[0], model.n_colors, 3) #(b, n_colors, rgb[3])
-#             preds.append(logits_mat)
-
-#             truth_mat = y[:, s, :model.n_colors]
-#             truth_flat  = truth_mat.view(truth_mat.size(0), -1) #(b, n_colors*3)
-
-#             # metrics
-#             loss += criterion(logits_flat, truth_flat)
-#             rgb_dist += utils.redmean_rgb_dist(logits_mat, truth_mat, scale_rgb=True)
-#             rgb_acc += utils.rgb_accuracy(logits_mat, truth_mat, scale_rgb=True, window_size=10)
-    
-#     rgb_dist /= seq_iters
-#     rgb_acc  /= seq_iters
-#     preds = torch.stack(preds, dim=1) #return shape: batch[1], seq_length, n_colors, rgb[3]
-
-#     return {"mse":loss.item(), "rgb_dist":rgb_dist.item(), "rgb_acc":rgb_acc}, preds
+    plot_melspec_seq(X)
+    for i in range(preds.shape[1]): #sequence 
+        plot_pred_true_palettes(y[0, i, :], preds[0, i, :])
