@@ -27,32 +27,23 @@ def get_audio_color(audio_file:str, audio_color_map_path:str, view=True):
         rgb = ac.loc[ac.audio_clip==filename, f"rgb_clust_{i}"].values[0]
         rgb = [int(c) for c in rgb.split()]
         colors.append(rgb)
+
     if view:
-        palette = [quick_color_display(col) for col in colors]
-        palette = np.vstack(palette)
+        color_seq = np.array([colors]) #(1, 5, 3)
+        high_lum = [int(c) for c in pick_highest_luminance(color_seq)[0][0]]
+        palette = np.vstack([quick_color_display(col) for col in colors])
         plt.imshow(palette)
         plt.axis("off")
         plt.title(filename)
         label_step = palette.shape[0] // len(colors)
         for i in range(len(colors)):
-            plt.text(palette.shape[1]+3, (label_step)*(i+1), str(colors[i]))
+            plt.text(x = palette.shape[1]+3, y = (label_step)*(i+1),
+             s = str(colors[i])+" (highest luminance)" if colors[i]==high_lum else str(colors[i])
+             )
         plt.show()
+    
+    return colors
 
-def pick_highest_luminance(y_array):
-    """Calculates which RGB color has the highest perceived luminance.
-    Selects (for each palette in a provided sequence) which color has the highest perceived luminance
-    using the simple relative luminance formula as seen here:
-    https://en.wikipedia.org/wiki/Relative_luminance
-    Returns an array of shape (sequence_length, 1, 3) given (sequence_length, N_colors, 3).
-    """
-    y_out = np.zeros((y_array.shape[0], 1, 3), dtype=np.float32) # seq_len, 1 color, rgb
-    lum_coef = np.array([[0.2126], [0.7152], [0.0722]])
-    # mat mul w lum coefs to get the highest perceived luminance of all colors in palette (applied per-palette)
-    y_lum = y_array @ lum_coef #5,5,3 @ 3,1 = 5,5,1
-    inds = np.argmax(y_lum, axis=1).flatten()
-    for i, ix in enumerate(inds):
-        y_out[i, :] = y_array[i, ix, :]
-    return y_out
 
 # METRICS ----------------------------------------------------------------------
 @torch.no_grad()
@@ -97,11 +88,58 @@ def redmean_rgb_dist(pred_tensor:torch.tensor, truth_tensor:torch.tensor, scale_
     return torch.mean( torch.sum(per_palette_loss, axis=1) )
 
 
-
- 
-
-
 # TRAINING UTILS --------------------------------------------------------------
+def create_patched_input(X:torch.tensor, n_patches:int=8, pad_method:str="zero"):
+    """X.shape = (?, Channels, Height/Features, Width/Time) 
+    Returns tensor of shape (?, n_patches, Channels, Height, feats_per_patch) where
+    feats_per_patch = (W // n_patches) + 1 if W % n_patches != 0 , or
+                    = W // n_patches if W % n_patches == 0  
+    """
+    device = X.device
+    if len(X.shape) == 3:
+        X = X.unsqueeze(0)
+    b, C, H, W = X.shape
+    feats_per_patch = W // n_patches
+    pad_array = None
+    if W % n_patches != 0:
+        feats_per_patch += 1
+        diff = feats_per_patch - (W - (feats_per_patch*(n_patches-1)))
+        assert diff < feats_per_patch, f"The width {W} cannot be split into {n_patches} patches of constant length."
+
+        if pad_method.lower().startswith("z"): #zero
+            pad_array = torch.zeros((b, C, H, diff))
+        elif pad_method.lower().startswith("me"): #mean
+            pad_array = torch.full(size=(b, C, H, diff), fill_value=X.mean())
+        elif pad_method.lower().startswith("mi"): #min
+            pad_array = torch.full(size=(b, C, H, diff), fill_value=X.min())
+        else:
+            raise NotImplementedError("Argument pad_method must be one of 'zero', 'mean', or 'min'.")
+
+    t = torch.empty((b, n_patches, C, H, feats_per_patch), device=device)
+    for i in range(n_patches):
+        patch = X[:,:,:, (i * feats_per_patch) : ((i+1)*feats_per_patch) ]
+        if (i+1) == n_patches and pad_array is not None:
+            pad_array = pad_array.to(device)
+            patch = torch.cat([patch, pad_array], axis=-1)
+        t[:, i] = patch
+    return t.flatten(-3,-1) #(batch, n_patches, feats)
+
+
+def pick_highest_luminance(y_array):
+    """Calculates which RGB color has the highest perceived luminance.
+    Selects (for each palette in a provided sequence) which color has the highest perceived luminance
+    using the simple relative luminance formula as seen here:
+    https://en.wikipedia.org/wiki/Relative_luminance
+    Returns an array of shape (sequence_length, 1, 3) given (sequence_length, N_colors, 3).
+    """
+    y_out = np.zeros((y_array.shape[0], 1, 3), dtype=np.float32) # seq_len, 1 color, rgb
+    lum_coef = np.array([[0.2126], [0.7152], [0.0722]]) #3,1
+    # mat mul w lum coefs to get the highest perceived luminance of all colors in palette (applied per-palette)
+    y_lum = y_array @ lum_coef #5,5,3 @ 3,1 = 5,5,1
+    inds = np.argmax(y_lum, axis=1).flatten()
+    for i, ix in enumerate(inds):
+        y_out[i, :] = y_array[i, ix, :]
+    return y_out
 
 def save_model_with_shape(model, 
                           save_dir, save_name="checkpoint", 

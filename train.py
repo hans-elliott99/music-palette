@@ -1,5 +1,6 @@
-
+#!/usr/bin/env python
 import os
+import sys
 import time
 import random
 import wandb 
@@ -11,9 +12,63 @@ import torch.nn as nn
 
 import src.utils as utils
 from src.dataload import SeqAudioRgbDataset, split_samples_by_song
-from src.models.transformers import ConvTransformer
+from src.models.transformers import ConvTransformer, PatchTransformer
 import src.models.configs as configs
 
+
+def convtransformer_update(X, y, model, criterion, optimizer=None):
+
+    batch_size = X.shape[0]
+    seq_len    = X.shape[1]
+
+    # FORWARD PASS
+    logits_flat = model(X) #(b, T, n_colors*3)
+    logits_mat = logits_flat.reshape(batch_size, seq_len, model.n_colors, 3) #(b, T, n_colors, rgb[3])
+
+    truth_mat = y[:,:, :model.n_colors, :]   #(b, T, n_colors, 3)
+    truth_flat = truth_mat.reshape(batch_size, seq_len, -1) #(b, T, n_colors*3)
+    loss = criterion(logits_flat, truth_flat)
+
+    # BACKWARDS
+    if optimizer is not None:
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    # Calc metrics
+    rgb_dist, rgb_acc = 0, 0
+    for i in range(seq_len):
+        rgb_dist += utils.redmean_rgb_dist(logits_mat[:, i, :], truth_mat[:, i, :], scale_rgb=True)
+        rgb_acc  += utils.rgb_accuracy(logits_mat[:, i, :], truth_mat[:, i, :], scale_rgb=True, window_size=10)
+
+    return loss.item(), rgb_acc/seq_len, rgb_dist.item()/seq_len
+
+
+def patchtransformer_update(X, y, model, criterion, config, optimizer=None):
+
+    batch_size = X.shape[0]
+
+    # FORWARD PASS
+    x = utils.create_patched_input(X, 
+                                   n_patches=config["n_patches"], 
+                                   pad_method="min") #(b, n_patches, feats)
+    logits_flat = model(x) #(b, n_colors*3)
+    logits_mat = logits_flat.reshape(batch_size, model.n_colors, 3) #(b, n_colors, rgb[3])
+
+    truth_mat = y[:, :model.n_colors, :]   #(b, n_colors, 3)
+    truth_flat = truth_mat.reshape(batch_size, -1) #(b, n_colors*3)
+    loss = criterion(logits_flat, truth_flat)
+
+    # BACKWARDS
+    if optimizer is not None:
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    # Calc metrics
+    rgb_dist = utils.redmean_rgb_dist(logits_mat, truth_mat, scale_rgb=True)
+    rgb_acc  = utils.rgb_accuracy(logits_mat, truth_mat, scale_rgb=True, window_size=10)
+    return loss.item(), rgb_acc, rgb_dist.item()
 
 
 def batched_trainloop(train_dataloader, model, criterion, optimizer, config, device, batch_print_freq=10):
@@ -29,41 +84,29 @@ def batched_trainloop(train_dataloader, model, criterion, optimizer, config, dev
         X = X.to(device)
         y = y.to(device)
 
-        batch_size = X.shape[0]
-        seq_len    = X.shape[1]
+        if isinstance(model, ConvTransformer):
+            loss, rgb_acc, rgb_dist = convtransformer_update(X, y, model, criterion, optimizer)
 
-        # FORWARD PASS
-        logits_flat = model(X) #(b, T, n_colors*3)
-        logits_mat = logits_flat.reshape(batch_size, seq_len, model.n_colors, 3) #(b, T, n_colors, rgb[3])
+        elif isinstance(model, PatchTransformer):
+            loss, rgb_acc, rgb_dist = 0, 0, 0
+            for i in range(X.shape[1]):
+                # while using the sequentially stored data, process each melspec in the sequence as independent sample
+                loss_, rgbacc_, rgbdist_ = patchtransformer_update(X[:,i,:], y[:,i,:], model, criterion, config, optimizer)
+                loss     += loss_/X.shape[1]
+                rgb_acc  += rgbacc_/X.shape[1]
+                rgb_dist += rgbdist_/X.shape[1]
 
-        truth_mat = y[:,:, :model.n_colors, :]   #(b, T, n_colors, 3)
-        truth_flat = truth_mat.reshape(batch_size, seq_len, -1) #(b, T, n_colors*3)
-        loss = criterion(logits_flat, truth_flat)
-
-        # BACKWARDS
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-
-
-        # Calc metrics
-        rgb_dist, rgb_acc = 0, 0
-        for i in range(seq_len):
-            rgb_dist += utils.redmean_rgb_dist(logits_mat[:, i, :], truth_mat[:, i, :], scale_rgb=True)
-            rgb_acc  += utils.rgb_accuracy(logits_mat[:, i, :], truth_mat[:, i, :], scale_rgb=True, window_size=10)
-        
         # Track metrics
-        losses.update(loss.item())
-        accs.update(rgb_acc/seq_len)
-        dists.update(rgb_dist.item()/seq_len)
+        losses.update(loss)
+        accs.update(rgb_acc)
+        dists.update(rgb_dist)
         batch_times.update(time.time() - time0)
 
-
-        if step % batch_print_freq == 0 or step==len(train_dataloader)-1:
+        if (step+1) % batch_print_freq == 0 or step in [0, len(train_dataloader)-1]:
             print(f" [Batch {step+1}/{len(train_dataloader)} (et={batch_times.last :.2f}s)]")
             print(f" \tLoss={losses.last :.5f} \tRGBdist={dists.last :.5f} \tAcc={accs.last :.5f}")
 
-    return losses, dists, accs 
+    return losses, dists, accs
 
 
 @torch.no_grad()
@@ -77,32 +120,28 @@ def batched_validloop(valid_dataloader, model, criterion, config, device):
         X = X.to(device)
         y = y.to(device)
 
-        batch_size = X.shape[0]
-        seq_len    = X.shape[1]
+        if isinstance(model, ConvTransformer):
+            loss, rgb_acc, rgb_dist = convtransformer_update(X, y, model, criterion)
 
-        # FORWARD PASS
-        logits_flat = model(X) #(b, T, n_colors*3)
-        logits_mat = logits_flat.reshape(batch_size, seq_len, model.n_colors, 3) #(b, T, n_colors, rgb[3])
+        elif isinstance(model, PatchTransformer):
+            loss, rgb_acc, rgb_dist = 0, 0, 0
+            for i in range(X.shape[1]):
+                # while using the sequentially stored data, process each melspec in the sequence as independent sample
+                loss_, rgbacc_, rgbdist_ = patchtransformer_update(X[:, i, :], y[:, i, :], model, criterion, config)
+                loss     += loss_
+                rgb_acc  += rgbacc_
+                rgb_dist += rgbdist_
 
-        truth_mat = y[:,:, :model.n_colors, :]   #(b, T, n_colors, 3)
-        truth_flat = truth_mat.reshape(batch_size, seq_len, -1)  #(b, T, n_colors*3)
-        loss = criterion(logits_flat, truth_flat)
-
-        # Calc metrics
-        rgb_dist, rgb_acc = 0, 0
-        for i in range(seq_len):
-            rgb_dist += utils.redmean_rgb_dist(logits_mat[:, i, :], truth_mat[:, i, :], scale_rgb=True)
-            rgb_acc  += utils.rgb_accuracy(logits_mat[:, i, :], truth_mat[:, i, :], scale_rgb=True, window_size=10)
-        
         # Track metrics
-        losses.update(loss.item())
-        accs.update(rgb_acc/seq_len)
-        dists.update(rgb_dist.item()/seq_len)
+        losses.update(loss)
+        accs.update(rgb_acc)
+        dists.update(rgb_dist)
     
     return losses, dists, accs
 
 accepted_models = {
     1 : "ConvTransformer",
+    2 : "PatchTransformer"
 }
 
 
@@ -113,43 +152,49 @@ if __name__=="__main__":
     AUDIO_DIR      = "./data/pop_videos/audio_wav"
     SPLITMETA_PATH = "./data/pop_videos/train_test_songs.json"
     
-    LOG_WANDB              = True
-    SAVE_CHECKPOINT        = True
+    LOG_WANDB              = False
+    SAVE_CHECKPOINT        = False
 
-    MODEL_SAVE_NAME        = "trfmr_highlum_reg"
+    MODEL_SAVE_NAME        = "testing"
     LOAD_CHECKPOINT        = f"./checkpoints/{MODEL_SAVE_NAME}.pth" #will be created if doesnt exist
     LOAD_CHECKPOINT_CONFIG = f"./checkpoints/{MODEL_SAVE_NAME}_config.json"
 
-    MODEL_CLASS  = ConvTransformer
-    MODEL_CONFIG = configs.ConvTrfmrRegularizeConfig
+    MODEL_CLASS  = PatchTransformer
+    MODEL_CONFIG = configs.PatchTrfmrBasicConfig
     DATALOADER   = SeqAudioRgbDataset
 
-    epochs = 100
+    epochs = 40
     config = {
         # Training specs
-        "batch_size" : 10,
+        "batch_size" : 5,
         "epochs"     : epochs,
         "last_epoch" : 0,  #will be overriden by checkpoint if one is loaded
+        "max_seq_len" : 5, #data is currently stored as such    TODO max_seq_len is really a ConvTransformer arg and part of its config, only needed here due to SeqAudioRGBDataset
+        "n_patches"  : 20, #if using patch-based vision transformer
 
         # Optimizer / LR
-        "lr" : 3e-4, #also the max lr if decay_lr==True
+        "lr" : 3e-5, #also the max lr if decay_lr==True
         "betas" : (0.9, 0.999),
-        "decay_lr" : True,
+        "decay_lr" : False,
         "min_lr" : 6e-5, #should be ~ lr / 10
         "lr_warmup_steps" : epochs // 5,
         "lr_decay_steps"  : epochs - (epochs//5),
+        "manual_new_lr"   : None, #set None to ignore
     }
     config = { **MODEL_CONFIG().to_dict(), **config }
 
-    
+    y_transform = None
     if config["n_colors"] == 1:
         y_transform = utils.pick_highest_luminance
-    else:
-        y_transform = None
+
+    # X_transform = None
+    # if config["n_patches"]:
+    #     assert MODEL_CLASS == PatchTransformer
+    #     X_transform = lambda x: utils.create_patched_input(x, config["n_patches"], pad_method="min")
 
     # -------------------------SETUP RUN------------------------- #
     use_cuda = torch.cuda.is_available()
-    device = "cuda:0" if use_cuda else "cpu"
+    device = torch.device("cuda:0") if use_cuda else torch.device("cpu")
     torch.cuda.empty_cache()
 
     wandb_key = dotenv_values(".env")["WANDB_KEY"]
@@ -180,22 +225,24 @@ if __name__=="__main__":
         random_seed   =seed
     )
     
-    train_dataset = DATALOADER(paths_list=train_paths,
+    train_dataset = DATALOADER(paths_list=train_paths,                      #TODO dont need sequential dataset for patched model
                                data_dir=DATA_DIR,
-                               max_seq_length=config["max_seq_len"],
+                               max_seq_length=config.get("max_seq_len"),
                                y_transform=y_transform
                                )
 
     valid_dataset = DATALOADER(paths_list=valid_paths,
                                data_dir=DATA_DIR,
-                               max_seq_length=config["max_seq_len"],
+                               max_seq_length=config.get("max_seq_len"),
                                y_transform=y_transform
                                )
-    train_dataset.remove_short_seqs() ##avoid padding for now, just remove short seqs
+    ##avoid padding for now, just remove short seqs
+    train_dataset.remove_short_seqs() 
     valid_dataset.remove_short_seqs()
 
     print("Train Samples:", len(train_dataset), 
-        "\nValid Samples:", len(valid_dataset))
+        "\nValid Samples:", len(valid_dataset),
+        "\nBatch Size:", config["batch_size"])
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -224,6 +271,8 @@ if __name__=="__main__":
     if not LOAD_CHECKPOINT or not model_exists:
         print("Preparing new model.")
         ex_x, _ = train_dataset[0]
+        if MODEL_CLASS == PatchTransformer:                                 #TODO clean the x_shape init
+            ex_x = utils.create_patched_input(ex_x, n_patches=config["n_patches"])
         model = MODEL_CLASS(X_shape=ex_x.shape, config=MODEL_CONFIG())
     else:
         print(f"Loading model checkpoint: {LOAD_CHECKPOINT}")
@@ -263,6 +312,9 @@ if __name__=="__main__":
                     warmup_iters=config['lr_warmup_steps'],
                     decay_iters=config['lr_decay_steps']
                     )
+                optimizer.param_groups[0]['lr'] = lr
+            elif config["manual_new_lr"] is not None:
+                lr = config["manual_new_lr"]
                 optimizer.param_groups[0]['lr'] = lr
 
             time0 = time.time()
@@ -307,7 +359,7 @@ if __name__=="__main__":
         config["last_epoch"] = ep
 
     except KeyboardInterrupt as e:
-        i = input("Training interrupred. Save model checkpoint? (y/n): ")
+        i = input("Training interrupred. Save model checkpoint? (y/n): \n")
         if i.lower().startswith("y"):
             SAVE_CHECKPOINT = True
             config["last_epoch"] = ep
@@ -316,11 +368,13 @@ if __name__=="__main__":
             SAVE_CHECKPOINT = False
 
     except Exception as e:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
         # model will be saved if save_checkpoint was set to True at beginning
         config["last_epoch"] = ep
         print("*ERROR* Training Interrupted.", "Checkpoint saved." if SAVE_CHECKPOINT else "")
+        print(exc_type, fname, exc_tb.tb_lineno)
         print(e)
-
 
 
     # Save metrics for analysis
