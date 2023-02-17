@@ -4,179 +4,21 @@ import torch.nn.functional as F
 import numpy as np
 import math
 
-
-# class AttHead(nn.Module):
-#     def __init__(self, block_size, head_size, in_feats, dropout) -> None:
-#         super().__init__()
-#         self.key = nn.Linear(in_feats, head_size, bias=False)
-#         self.query = nn.Linear(in_feats, head_size, bias=False)
-#         self.value = nn.Linear(in_feats, head_size, bias=False)
-#         # buffer: since tril is not a module, assign using register buffer
-#         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-#         self.dropout = nn.Dropout(dropout)
-
-#     def forward(self, x):
-#         B,T,C = x.shape
-#         k = self.key(x)
-#         q = self.query(x)
-#         # Compute attention scores ("affinities")
-#         wei = q @ k.transpose(-2, -1) * C**-0.5 #scaled, out:(B, T, T)
-#         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) #(B,T,T)
-#         wei = F.softmax(wei, dim=-1) #(B, T)
-#         wei = self.dropout(wei)
-#         # weigted aggregation
-#         v = self.value(x)
-#         out = wei @ v
-#         return out
-
-# class MultiHeadAttention(nn.Module):
-#     def __init__(self, block_size, num_heads, head_size, in_feats, dropout) -> None:
-#         super().__init__()
-#         self.heads = nn.ModuleList([
-#             AttHead(block_size, head_size, in_feats, dropout) for _ in range(num_heads)
-#         ])
-#         self.proj = nn.Linear(in_feats, in_feats)
-#         self.dropout = nn.Dropout(dropout)
-
-#     def forward(self, x):
-#         # Concatenate over channel/feature dimension (last dim)
-#         out = torch.cat([h(x) for h in self.heads], dim=-1)
-#         out = self.proj(out)
-#         return self.dropout(out)
-
-
-class CausalSelfAttention(nn.Module):
-    """
-    https://github.com/karpathy/minGPT/blob/master/mingpt/model.py#L30
-    Batch First Multi-Head Attention
-    """
-    def __init__(self, block_size, n_embed, n_head, attn_dropout=0., resid_dropout=0.):
-        super().__init__()
-        assert n_embed % n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(n_embed, 3 * n_embed)
-        # output projection
-        self.c_proj = nn.Linear(n_embed, n_embed)
-        # regularization
-        self.attn_dropout = nn.Dropout(attn_dropout)
-        self.resid_dropout = nn.Dropout(resid_dropout)
-        # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size))
-                                        .view(1, 1, block_size, block_size))
-        self.n_head = n_head
-        self.n_embed = n_embed
-
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embed)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embed, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-
-class FeedForward(nn.Module):
-    def __init__(self, in_feats, dropout) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_feats, 4*in_feats), #times 4, as in Attention is All You Need
-            # project back into residual pathway
-            nn.Linear(4*in_feats, in_feats),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-    def forward(self, x):
-        return self.net(x)
-
-
-class TfmrBlock(nn.Module):
-    """Transformer Block
-    LayerNorm
-    MultiHeadAttention
-    LayerNorm
-    FeedForward
-    """
-    def __init__(self, block_size, in_feats, n_heads, attn_dropout, resid_dropout, mlp_dropout) -> None:
-        super().__init__()
-        # head_size = in_feats // n_heads
-        self.ln1 = nn.LayerNorm(in_feats)
-        self.attn = CausalSelfAttention(block_size, n_embed=in_feats, n_head=n_heads, attn_dropout=attn_dropout, resid_dropout=resid_dropout)
-        self.ln2 = nn.LayerNorm(in_feats)
-        self.mlp = FeedForward(in_feats, mlp_dropout)
-    
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x)) #skip connections
-        x = x + self.mlp(self.ln2(x))
-        return x
-
-
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels, conv_filters, kernel_size, pool_size, dropout, conv_activ=nn.GELU) -> None:
-        """ConvolutionalBlock
-        Conv_kxk
-        BatchNorm
-        MaxPool_pxp
-        Skip-Connection Layer
-        """
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels=in_channels,
-                              out_channels=conv_filters,
-                              kernel_size=kernel_size,
-                              padding="same")
-        self.activ = conv_activ()
-        self.bn = nn.BatchNorm2d(num_features=conv_filters)
-        self.dropout = nn.Dropout(dropout)
-
-        if pool_size == 1 or None:
-            self.maxpool = None
-        else:
-            self.maxpool = nn.MaxPool2d(kernel_size=pool_size,
-                                        stride=pool_size)
-            
-        if self.maxpool is None and in_channels==conv_filters:
-            self.skip = False
-        else:        
-            self.skip = nn.Conv2d(in_channels=in_channels, out_channels=conv_filters,
-                                  kernel_size=1, stride=1, bias=False)
-
-    def forward(self, x):
-        """inspo: https://github.com/pytorch/vision/blob/a9a8220e0bcb4ce66a733f8c03a1c2f6c68d22cb/torchvision/models/resnet.py#L56-L72
-        """
-        identity = x
-        x = self.conv(x)
-        x = self.bn(x)
-        if self.maxpool:
-            x = self.maxpool(x)
-            identity = self.maxpool(identity)
-        if self.skip:
-            x += self.skip(identity)
-
-        x = self.activ(x)
-        return self.dropout(x)
+from src.models.modules import TfmrBlock, ConvBlock, LinearProjection
 
 
 # --------------------------------------------------------------------------- #
-#                              PURE TRANSFORMER                               #
+#                        PATCHED VISION TRANSFORMER                           #
 # --------------------------------------------------------------------------- #
-class SimpleTransformer(nn.modules.Module):
+class PatchTransformer(nn.modules.Module):
     """
+    Inputs are shape (n_patches, C, H, W_per_patch).
+    Inspired by ViT: https://arxiv.org/pdf/2010.11929.pdf
     """
     def __init__(self, 
                  X_shape,
                  n_colors=5,
+                 linear_layers=None,
                  n_heads=4,   #heads per layer
                  n_trfmr_layers=4,
                  embed_dropout=0.0,
@@ -190,6 +32,7 @@ class SimpleTransformer(nn.modules.Module):
 
         if config is not None:
             self.n_colors = config.n_colors
+            self.linear_layers = config.linear_layers
             self.n_heads = config.n_heads
             self.n_trfmr_layers = config.n_trfmr_layers
             self.embed_dropout = config.embed_dropout
@@ -200,6 +43,7 @@ class SimpleTransformer(nn.modules.Module):
 
         else:
             self.n_colors = n_colors
+            self.linear_layers = linear_layers
             self.n_heads = n_heads
             self.n_trfmr_layers = n_trfmr_layers
             self.embed_dropout = embed_dropout
@@ -208,45 +52,59 @@ class SimpleTransformer(nn.modules.Module):
             self.mlp_dropout = mlp_dropout
             self.sigmoid_logits = sigmoid_logits #Apply sigmoid to logits to keep in range(0, 1). Or, let the model learn it.
 
-        # Spectrogram input shape = (1, 128, 157)
-        if len(X_shape) == 4: #batch, C, H, W
-            self.input_shape = X_shape[1:] #seq, C, H, W
+        # Spectrogram input shape = (n_patches, n_features)
+        if len(X_shape) == 3: #batch, patches, features
+            self.input_shape = X_shape[1:]
         else:
-            assert len(X_shape) == 3
+            assert len(X_shape) == 2
             self.input_shape = X_shape
-
-        Channels, H_freq, W_time = self.input_shape #spectrogram input shape
+        N_patches, N_features = self.input_shape #spectrogram input shape
 
         # LAYERS
-        self.ln_0 = nn.LayerNorm([Channels, H_freq, W_time])
+        self.ln_0 = nn.LayerNorm([N_features])
+
+        # Patch Embeddings
+        # Linear Layers to Project to Constant Latent Vector Size
+        if self.linear_layers:
+            self.linear_layers = [N_features] + self.linear_layers
+            self.linear_proj = nn.ModuleList([
+                LinearProjection(in_feats=self.linear_layers[i],
+                                 out_feats=self.linear_layers[i+1],
+                                 dropout=mlp_dropout) for i in range(len(self.linear_layers)-1)
+            ])
+            n_feats = self.linear_layers[-1]
+        else:
+            self.linear_proj = None
+            n_feats = N_features
 
         # Standard Positional Embeddings
-        self.pos_embed = nn.Embedding(num_embeddings=W_time, embedding_dim=H_freq)
+        self.pos_embed = nn.Embedding(num_embeddings=N_patches, embedding_dim=n_feats)
         self.embed_drop = nn.Dropout(self.embed_dropout)
 
         # Transformer Blocks
         self.transformer = nn.ModuleList([
-            TfmrBlock(block_size=W_time, 
-                      in_feats=H_freq, 
+            TfmrBlock(block_size=N_patches, 
+                      in_feats=n_feats, 
                       n_heads=self.n_heads, 
                       attn_dropout=self.attn_dropout,
                       resid_dropout=self.resid_dropout,
                       mlp_dropout=self.mlp_dropout) for _ in range(self.n_trfmr_layers)
             ])
 
-        # Classifier / Head
-        self.head_ln = nn.LayerNorm(H_freq)
-        self.head_dense0 = nn.Linear(in_features=H_freq,
+        # Classifier Head
+        self.head_ln = nn.LayerNorm(n_feats)
+        self.head_dense0 = nn.Linear(in_features=n_feats,
                                    out_features=self.n_colors*3) #rgb
         self.head_sig  = nn.Sigmoid()
 
         # --apply special weight initializations--
-        self._special_init_weights()
+        self._init_weights()
 
         # --gen model stats--
         self.n_params = sum(p.numel() for p in self.parameters())    
 
-    def _special_init_weights(self):
+
+    def _init_weights(self):
         """
         Prep specific params with certain weight initialization stategies for better convergence.
         """
@@ -265,42 +123,39 @@ class SimpleTransformer(nn.modules.Module):
 
 
     def forward(self, X:torch.tensor):
-        # Input: (b, 1, 128, 157)
-        #      (batch, img_channels[1], img_height[n_mels], img_width[time])
-        if len(X.shape) == 4:
-            batch_size, C, H, W = X.shape
-        elif len(X.shape) == 3:
-            batch_size = 1
-            C, H, W = X.shape
-            X = X.unsqueeze(0) ##add batch dim
-        else:
-            raise RuntimeError("X.shape is incorrect")
-        
+        assert len(X.shape) == 3, "X must be of shape (batch_size, num_patches, features)"
+        # Input: (b, n_patches, n_features)
+        n_patches = self.input_shape[0]
         device = X.device
 
         x = self.ln_0(X)
-        x = x.squeeze(1) # remove Channel dimension
-        x = torch.transpose(x, 1, 2) #swap feature and time dimensions -> shape (b, time, feats)
+        # Linear Projection
+        if self.linear_proj:
+            for layer in self.linear_proj:
+                x = layer(x)
 
         # Positional Embeddings
-        pos = torch.arange(0, W, dtype=torch.long, device=device).unsqueeze(0) #shape (1, time)
-        pos = self.pos_embed(pos) #(1, time, feats)
+        pos = torch.arange(0, n_patches, dtype=torch.long, device=device).unsqueeze(0) #shape (1, patches)
+        pos = self.pos_embed(pos) #(1, patches, feats)
         x += pos
-        x = self.embed_drop(x)
-        # Shape: (b, time, feats)
+        x = self.embed_drop(x) # shape (b, patches, feats)
 
-        # Transformer
+        # Transformer Encoder
         for block in self.transformer:
-            x = block(x)
+            x = block(x) # shape (b, patches, feats)
+        
+        # Pool Hidden States
+        # TODO: Determine best pooling method/implement others. https://github.com/lucidrains/vit-pytorch/tree/main/vit_pytorch
+        # (average pool for now)
+        x = x.mean(dim=1)  #shape (b, feats)
 
         # Head / Classifier
-        x = self.head_ln(x) #final layer norm
-        logits = self.head_dense0(x)
+        x = self.head_ln(x)
+        logits = self.head_dense0(x) #shape (b, n_colors*3)
 
         if self.sigmoid_logits:
-            # apply sigmoid to keep logits in range 0 1
+            # apply sigmoid to keep logits in range [0 1]
             logits = self.head_sig(logits)
-
         return logits
 
 
@@ -312,13 +167,14 @@ class SimpleTransformer(nn.modules.Module):
             embed_dropout = self.embed_dropout,
             attn_dropout = self.attn_dropout,
             resid_dropout = self.resid_dropout,
-            sigmoid_logits = self.sigmoid_logits #Apply sigmoid to logits to keep in range(0, 1). Or, let the model learn it.
+            sigmoid_logits = self.sigmoid_logits
         )
     
     @staticmethod
     def get_empty_config():
         return dict(
             n_colors = None,
+            linear_layers = None,
             n_heads = None,
             n_trfmr_layers = None,
             embed_dropout = None,
@@ -465,7 +321,7 @@ class ConvTransformer(nn.modules.Module):
         self.head_sig  = nn.Sigmoid()
 
         # --apply special weight initializations--
-        self._special_init_weights()
+        self._init_weights()
 
         # --gen model stats--
         self.n_params = sum(p.numel() for p in self.parameters())
@@ -487,7 +343,7 @@ class ConvTransformer(nn.modules.Module):
             x = layer(x)
         return x.shape
 
-    def _special_init_weights(self):
+    def _init_weights(self):
         """
         Prep specific params with certain weight initialization stategies for better convergence.
         """
