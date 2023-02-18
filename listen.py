@@ -1,6 +1,6 @@
 
-from src.utils import quick_color_display
-from src.models.transformers import ConvTransformer
+from src.utils import quick_color_display, create_patched_input
+from src.models.transformers import ConvTransformer, PatchTransformer
 
 import torch
 import numpy as np
@@ -16,8 +16,9 @@ CHANNELS = 1
 RATE = 44100
 RECORD_SECONDS = 5 ##model-dependent
 device_index = 0
-model_path = "./checkpoints/trfmr_reg_highlum.pth"
+model_path = "./checkpoints/vit_base.pth"
 temp_recording = "_temp.wav"
+
 
 def record_next_clip(pyaudio_stream:pyaudio.Stream, sample_width, wav_filename):
     frames = []
@@ -41,8 +42,7 @@ def convert_to_melspec_tensor(wav_filename,
                             n_mels      = 128,   ##number of Mel bands to generate
                             n_fft       = 2048,  ##length of the FFT window
                             hop_length  = 512,   ##number of samples between successive frames
-                            verbosity   = 100):
-
+                            ):
     y, sr = librosa.load(wav_filename, sr=sample_rate)
     spec = librosa.feature.melspectrogram(y=y, sr=sr,
                                           n_mels=n_mels, 
@@ -102,7 +102,15 @@ if __name__=="__main__":
     model = model.to(device)
     model.eval()
 
-    block_size = model.max_seq_len
+    if isinstance(model, (ConvTransformer)):
+        mod = "conv"
+        block_size = model.max_seq_len
+    elif isinstance(model, (PatchTransformer)):
+        mod = "patch"
+        n_patches = 20#model.n_patches
+    else: 
+        raise NotImplementedError("Model type unrecognized.") 
+
 
     # Record audio
     p = pyaudio.PyAudio()
@@ -125,28 +133,35 @@ if __name__=="__main__":
         spec_t = convert_to_melspec_tensor(temp_recording)
         spec_t = preprocess_spec(spec_t) #shape (batch[1], time[1], C, H, W)
 
-        if spec_sequence is None:
-            spec_sequence = spec_t
-        else:
-            # Keep last (block_size-1) specs and append the new one by stacking
-            # on the time dimension (axis=1 or "column stack")
-            spec_sequence = torch.column_stack( 
-                (spec_sequence[:, -(block_size-1):, :], spec_t) 
-            ) 
-        
-        spec_sequence.to(device)
-        print(spec_sequence.shape)
+        if mod == "conv":
+            if spec_sequence is None:
+                spec_sequence = spec_t
+            else:
+                # Keep last (block_size-1) specs and append the new one by stacking
+                # on the time dimension (axis=1 or "column stack")
+                spec_sequence = torch.column_stack((
+                    spec_sequence[:, -(block_size-1):, :], 
+                    spec_t
+                )) 
+            
+            spec_sequence.to(device)
+            print(spec_sequence.shape)
+            # Send through model 
+            with torch.no_grad():
+                logits_flat = model(spec_sequence) #(1, seq_len, n_colors*3)
 
-        # Send through model 
-        with torch.no_grad():
-            logits_flat = model(spec_sequence)
-
+        elif mod == "patch":
+            with torch.no_grad():
+                x = create_patched_input(spec_t.squeeze(1), n_patches=20, pad_method="min")
+                print(x.shape)                    #(1, n_patches, feats)
+                logits_flat = model(x)            #(1, n_colors*3)
+                logits_flat = logits_flat.unsqueeze(1) #(1, 1, n_colors*3) for consistency w/ conv
 
         # Do something with the color palette
 
-        ## Let's plot the most recent mel and the most recently generate palette
+        ## Let's plot the most recent mel and the most recently generated palette
         mel = spec_t.reshape((128, 157, 1))
-        print(logits_flat[:, -1, :] * 255)
+        print(logits_flat[0, -1, :] * 255)
         plot_palette_with_melspec(logits_flat[:, -1, :], model.n_colors, mel)
         plt.show()
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 import os
 import sys
+import signal
+import atexit
 import time
 import random
 import wandb 
@@ -14,6 +16,11 @@ import src.utils as utils
 from src.dataload import SeqAudioRgbDataset, split_samples_by_song
 from src.models.transformers import ConvTransformer, PatchTransformer
 import src.models.configs as configs
+
+
+#TODO:
+# PatchTransformer doesnt need data to be stored in sequential format, since each sample is a single melspec -> palette
+# However, while the data is stored this way, could experiment with learnable memory across samples...
 
 
 def convtransformer_update(X, y, model, criterion, optimizer=None):
@@ -52,7 +59,8 @@ def patchtransformer_update(X, y, model, criterion, config, optimizer=None):
     x = utils.create_patched_input(X, 
                                    n_patches=config["n_patches"], 
                                    pad_method="min") #(b, n_patches, feats)
-    logits_flat = model(x) #(b, n_colors*3)
+
+    logits_flat = model(x) #(b, n_colors*3)     
     logits_mat = logits_flat.reshape(batch_size, model.n_colors, 3) #(b, n_colors, rgb[3])
 
     truth_mat = y[:, :model.n_colors, :]   #(b, n_colors, 3)
@@ -91,6 +99,7 @@ def batched_trainloop(train_dataloader, model, criterion, optimizer, config, dev
             loss, rgb_acc, rgb_dist = 0, 0, 0
             for i in range(X.shape[1]):
                 # while using the sequentially stored data, process each melspec in the sequence as independent sample
+                # (So really, one "batch" from dataloader is 5 batches)
                 loss_, rgbacc_, rgbdist_ = patchtransformer_update(X[:,i,:], y[:,i,:], model, criterion, config, optimizer)
                 loss     += loss_/X.shape[1]
                 rgb_acc  += rgbacc_/X.shape[1]
@@ -128,9 +137,9 @@ def batched_validloop(valid_dataloader, model, criterion, config, device):
             for i in range(X.shape[1]):
                 # while using the sequentially stored data, process each melspec in the sequence as independent sample
                 loss_, rgbacc_, rgbdist_ = patchtransformer_update(X[:, i, :], y[:, i, :], model, criterion, config)
-                loss     += loss_
-                rgb_acc  += rgbacc_
-                rgb_dist += rgbdist_
+                loss     += loss_/X.shape[1]
+                rgb_acc  += rgbacc_/X.shape[1]
+                rgb_dist += rgbdist_/X.shape[1]
 
         # Track metrics
         losses.update(loss)
@@ -152,33 +161,34 @@ if __name__=="__main__":
     AUDIO_DIR      = "./data/pop_videos/audio_wav"
     SPLITMETA_PATH = "./data/pop_videos/train_test_songs.json"
     
-    LOG_WANDB              = False
-    SAVE_CHECKPOINT        = False
+    LOG_WANDB              = True
+    SAVE_CHECKPOINT        = True
 
-    MODEL_SAVE_NAME        = "testing"
+    MODEL_SAVE_NAME        = None or wandb.util.generate_id()
     LOAD_CHECKPOINT        = f"./checkpoints/{MODEL_SAVE_NAME}.pth" #will be created if doesnt exist
     LOAD_CHECKPOINT_CONFIG = f"./checkpoints/{MODEL_SAVE_NAME}_config.json"
 
     MODEL_CLASS  = PatchTransformer
-    MODEL_CONFIG = configs.PatchTrfmrBasicConfig
+    MODEL_CONFIG = configs.PatchTrfmrRegularizeConfig
     DATALOADER   = SeqAudioRgbDataset
 
-    epochs = 40
+    epochs = 500
+    batch_size = 32
     config = {
         # Training specs
-        "batch_size" : 5,
+        "batch_size" : batch_size,
         "epochs"     : epochs,
         "last_epoch" : 0,  #will be overriden by checkpoint if one is loaded
         "max_seq_len" : 5, #data is currently stored as such    TODO max_seq_len is really a ConvTransformer arg and part of its config, only needed here due to SeqAudioRGBDataset
-        "n_patches"  : 20, #if using patch-based vision transformer
 
         # Optimizer / LR
-        "lr" : 3e-5, #also the max lr if decay_lr==True
+        "lr" : 3e-4, #also the max lr if decay_lr==True
         "betas" : (0.9, 0.999),
-        "decay_lr" : False,
-        "min_lr" : 6e-5, #should be ~ lr / 10
-        "lr_warmup_steps" : epochs // 5,
-        "lr_decay_steps"  : epochs - (epochs//5),
+        "weight_decay" : 3e-5,
+        "decay_lr" : True,
+        "min_lr" : 3e-5,  #should be ~ lr / 10
+        "lr_warmup_steps" : 10,
+        "lr_decay_steps"  : epochs - 10,
         "manual_new_lr"   : None, #set None to ignore
     }
     config = { **MODEL_CONFIG().to_dict(), **config }
@@ -201,9 +211,11 @@ if __name__=="__main__":
     if LOG_WANDB:
         wandb.login(key=wandb_key)
         wandb.init(
+            id=MODEL_SAVE_NAME,
+            resume="allow",
             project="MusicPalette",
             config=config,
-            group="ConvTransformer",
+            group="PatchTransformer",
             anonymous="allow"
         )
 
@@ -269,7 +281,7 @@ if __name__=="__main__":
 
     start_epoch = 0
     if not LOAD_CHECKPOINT or not model_exists:
-        print("Preparing new model.")
+        print(f"Preparing new model: {MODEL_SAVE_NAME}.")
         ex_x, _ = train_dataset[0]
         if MODEL_CLASS == PatchTransformer:                                 #TODO clean the x_shape init
             ex_x = utils.create_patched_input(ex_x, n_patches=config["n_patches"])
@@ -289,9 +301,12 @@ if __name__=="__main__":
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), 
                                   lr=config["lr"],
-                                  betas=config['betas'])
+                                  betas=config['betas'],
+                                  weight_decay=config['weight_decay']
+                                  )
 
     # -------------------------TRAIN LOOP------------------------- #
+    saved_successfully = False
     if LOG_WANDB:
         wandb.watch(model)
 
@@ -305,7 +320,7 @@ if __name__=="__main__":
             if config['decay_lr']:
                 # Update lr: pass in the current iter (1-based), relative
                 # to starting iter. 
-                lr = utils.lr_decay_cosinewarmup(
+                lr = utils.lr_linearwarmup_cosinedecay(
                     (ep+1)-start_epoch, 
                     max_lr=config['lr'],
                     min_lr=config['min_lr'],
@@ -326,7 +341,7 @@ if __name__=="__main__":
                                            optimizer=optimizer,
                                            config=config, 
                                            device=device,
-                                           batch_print_freq=10)
+                                           batch_print_freq=15)
             ep_losses.append(el.mean)
             ep_dists.append(ed.mean)
             ep_accs.append(ea.mean)
@@ -356,8 +371,18 @@ if __name__=="__main__":
                     "acc"          : ea.mean, "val_acc"      : va.mean,
                     "lr"           : lr
                 })
-        config["last_epoch"] = ep
 
+            if (ep+1) % 100 == 0:
+                print("Saving model checkpoint.")
+                config["last_epoch"] = ep
+                utils.save_model_with_shape(model, 
+                                save_dir="./checkpoints",
+                                save_name=f"{MODEL_SAVE_NAME}_ep{ep}", 
+                                config_file=f"{MODEL_SAVE_NAME}_config.json", 
+                                config=config)
+            #end of epoch iteration -----
+
+        config["last_epoch"] = ep
     except KeyboardInterrupt as e:
         i = input("Training interrupred. Save model checkpoint? (y/n): \n")
         if i.lower().startswith("y"):
@@ -377,10 +402,11 @@ if __name__=="__main__":
         print(e)
 
 
-    # Save metrics for analysis
-    log = utils.JsonLog(f"./checkpoints/{MODEL_SAVE_NAME}_metricslog.json")
-    log.write(train_loss=ep_losses, train_rgbdist=ep_dists, train_acc=ep_accs,
-              val_loss=val_losses, val_rgbdists=val_dists, val_acc=val_accs)
+    if not LOG_WANDB:
+        # Save metrics for analysis
+        log = utils.JsonLog(f"./checkpoints/{MODEL_SAVE_NAME}_metricslog.json")
+        log.write(train_loss=ep_losses, train_rgbdist=ep_dists, train_acc=ep_accs,
+                  val_loss=val_losses, val_rgbdists=val_dists, val_acc=val_accs)
     
     # Save model and configuration
     if SAVE_CHECKPOINT:
@@ -389,3 +415,6 @@ if __name__=="__main__":
                                     save_name=MODEL_SAVE_NAME, 
                                     config_file=f"{MODEL_SAVE_NAME}_config.json", 
                                     config=config)
+        saved_successfully = True
+
+    
