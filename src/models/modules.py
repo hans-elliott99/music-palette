@@ -46,31 +46,29 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-
-class TrfmrFeedForward(nn.Module):
-    def __init__(self, in_feats, dropout):
+class LinearProjection(nn.Module):
+    def __init__(self, in_feats, out_feats, dropout=0., bias=False):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_feats, 4*in_feats), #times 4, as in Attention is All You Need
-            nn.GELU(),
-            # project back into residual pathway
-            nn.Linear(4*in_feats, in_feats),
+            nn.Linear(in_feats, out_feats, bias=bias),
             nn.Dropout(dropout)
         )
     def forward(self, x):
         return self.net(x)
 
-
-class LinearProjection(nn.Module):
-    def __init__(self, in_feats, out_feats, dropout):
+class TrfmrFeedForward(nn.Module):
+    def __init__(self, in_feats, hidden_ratio=4, dropout=0.):
+        #default in_feats*4, as in Attention is All You Need & AN IMAGE IS WORTH 16X16 WORDS (ViT)
         super().__init__()
         self.net = nn.Sequential(
-
-            nn.Linear(in_feats, out_feats),
+            nn.Linear(in_feats, hidden_ratio*in_feats), 
+            nn.GELU(),
+            # project back into residual pathway
+            nn.Linear(hidden_ratio*in_feats, in_feats),
+            nn.Dropout(dropout)
         )
     def forward(self, x):
         return self.net(x)
-
 
 class TfmrBlock(nn.Module):
     """Transformer Block
@@ -82,10 +80,11 @@ class TfmrBlock(nn.Module):
     def __init__(self, block_size, in_feats, n_heads, attn_dropout, resid_dropout, mlp_dropout):
         super().__init__()
         # head_size = in_feats // n_heads
+        mlp_ratio = 4
         self.ln1 = nn.LayerNorm(in_feats)
         self.attn = CausalSelfAttention(block_size, n_embed=in_feats, n_head=n_heads, attn_dropout=attn_dropout, resid_dropout=resid_dropout)
         self.ln2 = nn.LayerNorm(in_feats)
-        self.mlp = TrfmrFeedForward(in_feats, mlp_dropout)
+        self.mlp = TrfmrFeedForward(in_feats, mlp_ratio, mlp_dropout)
     
     def forward(self, x):
         x = x + self.attn(self.ln1(x)) #skip connections

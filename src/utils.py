@@ -89,6 +89,8 @@ def redmean_rgb_dist(pred_tensor:torch.tensor, truth_tensor:torch.tensor, scale_
 
 
 # TRAINING UTILS --------------------------------------------------------------
+
+#TODO: allow for patching in the time AND frequency direction - see https://arxiv.org/pdf/2110.05069v3.pdf
 def create_patched_input(X:torch.tensor, n_patches:int=8, pad_method:str="zero"):
     """X.shape = (?, Channels, Height/Features, Width/Time) 
     Returns tensor of shape (?, n_patches, Channels, Height, feats_per_patch) where
@@ -212,7 +214,7 @@ def load_json(file):
 
 
 
-def lr_decay_cosinewarmup(iter_1_based, max_lr, min_lr=6e-5, warmup_iters=50, decay_iters=50):
+def lr_linearwarmup_cosinedecay(iter_1_based, max_lr, min_lr=6e-5, warmup_iters=50, decay_iters=50):
     """https://github.com/karpathy/nanoGPT/blob/master/train.py
     """
     # do a linear warmup to max_lr for the first given iters

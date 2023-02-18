@@ -10,6 +10,7 @@ from src.models.modules import TfmrBlock, ConvBlock, LinearProjection
 # --------------------------------------------------------------------------- #
 #                        PATCHED VISION TRANSFORMER                           #
 # --------------------------------------------------------------------------- #
+#TODO: Time embeddings are rudimentary, need to better index which pixels are from which time bin
 class PatchTransformer(nn.modules.Module):
     """
     Inputs are shape (n_patches, C, H, W_per_patch).
@@ -18,6 +19,9 @@ class PatchTransformer(nn.modules.Module):
     def __init__(self, 
                  X_shape,
                  n_colors=5,
+                 n_patches=20,
+                 n_freq_bins = None,
+                 n_time_bins = None,
                  linear_layers=None,
                  n_heads=4,   #heads per layer
                  n_trfmr_layers=4,
@@ -32,6 +36,9 @@ class PatchTransformer(nn.modules.Module):
 
         if config is not None:
             self.n_colors = config.n_colors
+            self.n_patches = config.n_patches
+            self.n_freq_bins = config.n_freq_bins
+            self.n_time_bins = config.n_time_bins
             self.linear_layers = config.linear_layers
             self.n_heads = config.n_heads
             self.n_trfmr_layers = config.n_trfmr_layers
@@ -43,6 +50,9 @@ class PatchTransformer(nn.modules.Module):
 
         else:
             self.n_colors = n_colors
+            self.n_patches = n_patches
+            self.n_freq_bins = n_freq_bins
+            self.n_time_bins = n_time_bins
             self.linear_layers = linear_layers
             self.n_heads = n_heads
             self.n_trfmr_layers = n_trfmr_layers
@@ -66,19 +76,42 @@ class PatchTransformer(nn.modules.Module):
         # Patch Embeddings
         # Linear Layers to Project to Constant Latent Vector Size
         if self.linear_layers:
+            if not isinstance(self.linear_layers, list):
+                self.linear_layers = [self.linear_layers]
             self.linear_layers = [N_features] + self.linear_layers
             self.linear_proj = nn.ModuleList([
                 LinearProjection(in_feats=self.linear_layers[i],
                                  out_feats=self.linear_layers[i+1],
-                                 dropout=mlp_dropout) for i in range(len(self.linear_layers)-1)
+                                 dropout=0.,
+                                 bias=False) for i in range(len(self.linear_layers)-1)
             ])
             n_feats = self.linear_layers[-1]
         else:
             self.linear_proj = None
             n_feats = N_features
 
-        # Standard Positional Embeddings
+        # Frequency Embeddings
+        if self.n_freq_bins is not None:
+            # freqs normalized to -1, 1.. add small value to avoid boundaries not being included 
+            self.freq_bins  = torch.linspace(-1.01, 1.01, self.n_freq_bins)
+            self.freq_embed = nn.Embedding(num_embeddings=self.n_freq_bins, embedding_dim=n_feats)
+        else:
+            self.freq_bins  = None
+            self.freq_embed = None
+        
+        # Time Embeddings
+        self.time_idx_tensor = None
+        if self.n_time_bins is not None:
+            self.time_bins  = torch.arange(0, self.n_time_bins)
+            self.time_embed = nn.Embedding(num_embeddings=self.n_time_bins, embedding_dim=n_feats)
+        else:
+            self.time_bins  = None
+            self.time_embed = None
+
+        # Standard Positional/Patch Embeddings
         self.pos_embed = nn.Embedding(num_embeddings=N_patches, embedding_dim=n_feats)
+
+        # Embedding dropout
         self.embed_drop = nn.Dropout(self.embed_dropout)
 
         # Transformer Blocks
@@ -97,14 +130,11 @@ class PatchTransformer(nn.modules.Module):
                                    out_features=self.n_colors*3) #rgb
         self.head_sig  = nn.Sigmoid()
 
-        # --apply special weight initializations--
-        self._init_weights()
-
-        # --gen model stats--
+        # apply weight init
+        self.init_weights()
         self.n_params = sum(p.numel() for p in self.parameters())    
 
-
-    def _init_weights(self):
+    def init_weights(self):
         """
         Prep specific params with certain weight initialization stategies for better convergence.
         """
@@ -121,6 +151,19 @@ class PatchTransformer(nn.modules.Module):
                 nn.init.zeros_(child.bias)
                 nn.init.ones_(child.weight)
 
+    
+    def bin_frequencies(self, x):
+        f = torch.bucketize(x, self.freq_bins.to(x.device)) - 1 ##make 0 indexed
+        return f.to(x.device)
+
+    def bin_time(self, x):
+        _, n_patches, feats = x.shape
+        if self.time_idx_tensor is None:
+            time_ix = torch.cumsum(
+                torch.ones((1, n_patches, feats), dtype=torch.long), 
+                dim=2)
+            self.time_idx_tensor = torch.bucketize(time_ix, self.time_bins) - 1
+        return self.time_idx_tensor.to(x.device)
 
     def forward(self, X:torch.tensor):
         assert len(X.shape) == 3, "X must be of shape (batch_size, num_patches, features)"
@@ -128,8 +171,25 @@ class PatchTransformer(nn.modules.Module):
         n_patches = self.input_shape[0]
         device = X.device
 
-        x = self.ln_0(X)
+        x = X.clone()
+        # Frequency Embeddings
+        # Get frequency embeddings, pool per-patch, add to x
+        if self.freq_embed:
+            freq = self.bin_frequencies(X)    #shape (b, n_patches, feats) -> now an index tensor
+            freq = self.freq_embed(freq)      #shape (b, n_patches, feats, embed_feats)
+            freq = freq.mean(dim=3)           #shape (b, n_patches, feats)
+            x += freq
+
+        # Time Embeddings
+        # Get time embeddings, pool per-patch, add to x
+        if self.time_embed:
+            time = self.bin_time(X)
+            time = self.time_embed(time)
+            time = time.mean(dim=3)         #shape (b, n_patches, feats)
+            x += time
+
         # Linear Projection
+        x = self.ln_0(x)
         if self.linear_proj:
             for layer in self.linear_proj:
                 x = layer(x)
@@ -137,10 +197,11 @@ class PatchTransformer(nn.modules.Module):
         # Positional Embeddings
         pos = torch.arange(0, n_patches, dtype=torch.long, device=device).unsqueeze(0) #shape (1, patches)
         pos = self.pos_embed(pos) #(1, patches, feats)
+
         x += pos
         x = self.embed_drop(x) # shape (b, patches, feats)
 
-        # Transformer Encoder
+        # Transformer
         for block in self.transformer:
             x = block(x) # shape (b, patches, feats)
         
@@ -157,24 +218,15 @@ class PatchTransformer(nn.modules.Module):
             # apply sigmoid to keep logits in range [0 1]
             logits = self.head_sig(logits)
         return logits
-
-
-    def get_config(self):
-        return dict(
-            n_colors = self.n_colors,
-            n_heads = self.n_heads,
-            n_trfmr_layers = self.n_trfmr_layers,
-            embed_dropout = self.embed_dropout,
-            attn_dropout = self.attn_dropout,
-            resid_dropout = self.resid_dropout,
-            sigmoid_logits = self.sigmoid_logits
-        )
     
     @staticmethod
     def get_empty_config():
         return dict(
             n_colors = None,
+            n_patches = None,
             linear_layers = None,
+            n_time_bins = None,
+            n_freq_bins = None,
             n_heads = None,
             n_trfmr_layers = None,
             embed_dropout = None,
