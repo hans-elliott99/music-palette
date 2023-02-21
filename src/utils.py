@@ -17,6 +17,35 @@ def quick_color_display(rgb:list, h=30, w=30):
     return block.astype(np.uint8)
 
 
+def plot_predicted_melspec(true_melspec, pred_array, savename=None, **kwargs):
+    """
+    true_melspec: shape=(Channels[1], Height[mel-spec features], Width[time-steps])
+    pred_array  : shape=(Batch Dim[optional], Number of Patches, Predicted Features)
+    savename    : Str or None. If provided, save fig to image.
+    kwargs      : include options for plt.figure
+    """
+    if len(pred_array.shape) == 3:
+        n_patches = pred_array.shape[1]
+    else:
+        n_patches = pred_array.shape[0]
+    mel_spec_feats = true_melspec.shape[1]
+    timeunits_per_patch = int(math.prod(pred_array.shape) / (n_patches*mel_spec_feats))
+    out_img = pred_array.reshape(n_patches, mel_spec_feats, timeunits_per_patch).detach()
+    out_img = torch.concat([out_img[i] for i in range(out_img.shape[0])], axis=1)
+    
+    plt.figure(**kwargs)
+    plt.subplot(211)
+    plt.imshow(true_melspec.squeeze(0))
+    plt.title("True Mel-Spec")
+    plt.subplot(212)
+    plt.imshow(out_img)
+    plt.title("Generated Mel-Spec")
+    if savename is not None:
+        plt.savefig(savename)
+    else:
+        plt.show()
+
+
 def get_audio_color(audio_file:str, audio_color_map_path:str, view=True):
     audio_file = audio_file.lower().replace("\\", "/")
     filename = audio_file.split("/")[-1]
