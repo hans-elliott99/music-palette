@@ -7,6 +7,241 @@ import math
 from src.models.modules import TfmrBlock, ConvBlock, LinearProjection
 
 
+#TODO: Time embeddings are rudimentary, need to better index which pixels are from which time bin
+#TODO: Determine best pooling method/implement others for transformer encoders. https://github.com/lucidrains/vit-pytorch/tree/main/vit_pytorch
+#TODO: Implemen "patch-out": https://github.com/kkoutini/PaSST
+# --------------------------------------------------------------------------- #
+#                      GENERATIVE PATCH TRANSFORMER                           #
+# --------------------------------------------------------------------------- #
+
+class GPTPatchTransformer(nn.modules.Module):
+    """
+    Inputs are shape (n_patches, C, H, W_per_patch).
+    C: Image Channels, ie 1 for a Mel-Spectrogram
+    H: Image Height / Number of Mel-Features
+    W_per_patch: The width of each Mel-Spectrogram patch
+
+    Inspired by ViT: https://arxiv.org/pdf/2010.11929.pdf
+    """
+    def __init__(self, 
+                 X_shape,
+                 n_colors=5,
+                 n_patches=20,
+                 n_freq_bins = None,
+                 n_time_bins = None,
+                 linear_layers=None,
+                 n_heads=4,   #heads per layer
+                 n_trfmr_layers=4,
+                 embed_dropout=0.0,
+                 attn_dropout=0.0,
+                 resid_dropout=0.0,
+                 mlp_dropout=0.0,
+                 config=None
+                 ) -> None:
+        super().__init__()
+
+        if config is not None:
+            self.n_colors = config.n_colors
+            self.n_patches = config.n_patches
+            self.n_freq_bins = config.n_freq_bins
+            self.n_time_bins = config.n_time_bins
+            self.linear_layers = config.linear_layers
+            self.n_heads = config.n_heads
+            self.n_trfmr_layers = config.n_trfmr_layers
+            self.embed_dropout = config.embed_dropout
+            self.attn_dropout = config.attn_dropout
+            self.resid_dropout = config.resid_dropout
+            self.mlp_dropout = config.mlp_dropout
+
+        else:
+            self.n_colors = n_colors
+            self.n_patches = n_patches
+            self.n_freq_bins = n_freq_bins
+            self.n_time_bins = n_time_bins
+            self.linear_layers = linear_layers
+            self.n_heads = n_heads
+            self.n_trfmr_layers = n_trfmr_layers
+            self.embed_dropout = embed_dropout
+            self.attn_dropout = attn_dropout
+            self.resid_dropout = resid_dropout
+            self.mlp_dropout = mlp_dropout
+
+        # Spectrogram input shape = (n_patches, n_features)
+        if len(X_shape) == 3: #batch, patches, features
+            self.input_shape = X_shape[1:]
+        else:
+            assert len(X_shape) == 2
+            self.input_shape = X_shape
+        N_patches, N_features = self.input_shape #spectrogram input shape
+
+        # LAYERS
+        self.ln_0 = nn.LayerNorm(N_features)
+
+        # Patch Embeddings
+        # Linear Layers to Project to Constant Latent Vector Size
+        if self.linear_layers:
+            if not isinstance(self.linear_layers, list):
+                self.linear_layers = [self.linear_layers]
+            self.linear_layers = [N_features] + self.linear_layers
+            self.linear_proj = nn.ModuleList([
+                LinearProjection(in_feats=self.linear_layers[i],
+                                 out_feats=self.linear_layers[i+1],
+                                 dropout=0.,
+                                 bias=False) for i in range(len(self.linear_layers)-1)
+            ])
+            n_feats = self.linear_layers[-1]
+        else:
+            self.linear_proj = None
+            n_feats = N_features
+
+        # Frequency Embeddings
+        if self.n_freq_bins is not None:
+            # freqs normalized to -1, 1.. add small value to avoid boundaries not being included 
+            self.freq_bins  = torch.linspace(-1.01, 1.01, self.n_freq_bins)
+            self.freq_embed = nn.Embedding(num_embeddings=self.n_freq_bins, embedding_dim=n_feats)
+        else:
+            self.freq_bins  = None
+            self.freq_embed = None
+        
+        # Time Embeddings
+        self.time_idx_tensor = None
+        if self.n_time_bins is not None:
+            self.time_bins  = torch.arange(0, self.n_time_bins)
+            self.time_embed = nn.Embedding(num_embeddings=self.n_time_bins, embedding_dim=n_feats)
+        else:
+            self.time_bins  = None
+            self.time_embed = None
+
+        # Standard Positional/Patch Embeddings
+        self.pos_embed = nn.Embedding(num_embeddings=N_patches, embedding_dim=n_feats)
+
+        # Embedding dropout
+        self.embed_drop = nn.Dropout(self.embed_dropout)
+
+        # Transformer Blocks
+        self.transformer = nn.ModuleList([
+            TfmrBlock(block_size=N_patches, 
+                      in_feats=n_feats, 
+                      n_heads=self.n_heads, 
+                      attn_dropout=self.attn_dropout,
+                      resid_dropout=self.resid_dropout,
+                      mlp_dropout=self.mlp_dropout) for _ in range(self.n_trfmr_layers)
+            ])
+
+        # Generative Pretrain Head
+        self.head_ln_pt = nn.LayerNorm(n_feats)
+        self.head_dense_pt = nn.Linear(in_features=n_feats,
+                                     out_features=N_features) #rgb
+        
+        # Classifier Head
+        self.head_ln_clf = nn.LayerNorm(n_feats)
+        self.head_dense_clf = nn.Linear(in_features=n_feats,
+                                     out_features=self.n_colors*3)
+
+        # apply weight init
+        self.init_weights()
+        self.n_params = sum(p.numel() for p in self.parameters())    
+
+    def init_weights(self):
+        """
+        Prep specific params with certain weight initialization stategies for better convergence.
+        """
+        for child in self.children():
+            if isinstance(child, (nn.Linear)):
+                nn.init.normal_(child.weight, mean=0.0, std=0.02)
+                if child.bias is not None:
+                    nn.init.zeros_(child.bias)
+
+            elif isinstance(child, (nn.Embedding)):
+                nn.init.normal_(child.weight, mean=0.0, std=0.02)
+            
+            elif isinstance(child, (nn.LayerNorm)):
+                nn.init.zeros_(child.bias)
+                nn.init.ones_(child.weight)
+
+    
+    def bin_frequencies(self, x):
+        f = torch.bucketize(x, self.freq_bins.to(x.device)) - 1 ##make 0 indexed
+        return f.to(x.device)
+
+    def bin_time(self, x):
+        _, n_patches, feats = x.shape
+        if self.time_idx_tensor is None:
+            time_ix = torch.cumsum(
+                torch.ones((1, n_patches, feats), dtype=torch.long), 
+                dim=2)
+            self.time_idx_tensor = torch.bucketize(time_ix, self.time_bins) - 1
+        return self.time_idx_tensor.to(x.device)
+
+    def forward(self, X:torch.tensor, pretraining:bool=False):
+        assert len(X.shape) == 3, "X must be of shape (batch_size, num_patches, features)"
+        # Input: (b, n_patches, n_features)
+        n_patches = self.input_shape[0]
+        device = X.device
+
+        x = X.clone()
+        # Frequency Embeddings
+        # Get frequency embeddings, pool per-patch, add to x
+        if self.freq_embed:
+            freq = self.bin_frequencies(X)    #shape (b, n_patches, feats) -> now an index tensor
+            freq = self.freq_embed(freq)      #shape (b, n_patches, feats, embed_feats)
+            freq = freq.mean(dim=3)           #shape (b, n_patches, feats)
+            x += freq
+
+        # Time Embeddings
+        # Get time embeddings, pool per-patch, add to x
+        if self.time_embed:
+            time = self.bin_time(X)
+            time = self.time_embed(time)
+            time = time.mean(dim=3)         #shape (b, n_patches, feats)
+            x += time
+
+        # Linear Projection
+        x = self.ln_0(x)
+        if self.linear_proj:
+            for layer in self.linear_proj:
+                x = layer(x)
+
+        # Positional Embeddings
+        pos = torch.arange(0, n_patches, dtype=torch.long, device=device).unsqueeze(0) #shape (1, patches)
+        pos = self.pos_embed(pos) #(1, patches, feats)
+
+        x += pos
+        x = self.embed_drop(x) # shape (b, patches, feats)
+
+        # Transformer
+        for block in self.transformer:
+            x = block(x) # shape (b, patches, feats)
+        
+        # Head / Classifier
+        if pretraining:
+            x = self.head_ln_pt(x)
+            logits = self.head_dense_pt(x)
+        else:
+            # Pool Hidden States
+            x = x.mean(dim=1)  #shape (b, feats)
+            x = self.head_ln_clf(x)
+            logits = self.head_dense_clf(x) #shape (b, n_colors*3)
+
+        return logits
+    
+    @staticmethod
+    def get_empty_config():
+        return dict(
+            n_colors = None,
+            n_patches = None,
+            linear_layers = None,
+            n_time_bins = None,
+            n_freq_bins = None,
+            n_heads = None,
+            n_trfmr_layers = None,
+            embed_dropout = None,
+            attn_dropout = None,
+            resid_dropout = None,
+        )
+
+
+
 # --------------------------------------------------------------------------- #
 #                        PATCHED VISION TRANSFORMER                           #
 # --------------------------------------------------------------------------- #
