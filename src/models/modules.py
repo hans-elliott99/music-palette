@@ -49,26 +49,25 @@ class CausalSelfAttention(nn.Module):
 class LinearProjection(nn.Module):
     def __init__(self, in_feats, out_feats, dropout=0., bias=False):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_feats, out_feats, bias=bias),
-            nn.Dropout(dropout)
-        )
+        self.linear  = nn.Linear(in_feats, out_feats, bias=bias)
+        self.proj_dropout = nn.Dropout(dropout)
     def forward(self, x):
-        return self.net(x)
+        return self.proj_dropout(self.linear(x))
 
-class TrfmrFeedForward(nn.Module):
+class MLP_Trfmr(nn.Module):
     def __init__(self, in_feats, hidden_ratio=4, dropout=0.):
-        #default in_feats*4, as in Attention is All You Need & AN IMAGE IS WORTH 16X16 WORDS (ViT)
+        #default in_feats*4, as in Attention is All You Need & An Image Is Worth 16X16 Words (ViT)
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_feats, hidden_ratio*in_feats), 
-            nn.GELU(),
+        self.linear_in  = nn.Linear(in_feats, hidden_ratio*in_feats), 
+        self.gelu       = nn.GELU(),
             # project back into residual pathway
-            nn.Linear(hidden_ratio*in_feats, in_feats),
-            nn.Dropout(dropout)
-        )
+        self.linear_out = nn.Linear(hidden_ratio*in_feats, in_feats),
+        self.mlp_dropout= nn.Dropout(dropout)
+
     def forward(self, x):
-        return self.net(x)
+        o = self.gelu(self.linear_in(x))
+        return self.mlp_dropout(self.linear_out(o))
+
 
 class TfmrBlock(nn.Module):
     """Transformer Block
@@ -84,12 +83,13 @@ class TfmrBlock(nn.Module):
         self.ln1 = nn.LayerNorm(in_feats)
         self.attn = CausalSelfAttention(block_size, n_embed=in_feats, n_head=n_heads, attn_dropout=attn_dropout, resid_dropout=resid_dropout)
         self.ln2 = nn.LayerNorm(in_feats)
-        self.mlp = TrfmrFeedForward(in_feats, mlp_ratio, mlp_dropout)
+        self.mlp = MLP_Trfmr(in_feats, mlp_ratio, mlp_dropout)
     
     def forward(self, x):
         x = x + self.attn(self.ln1(x)) #skip connections
         x = x + self.mlp(self.ln2(x))
         return x
+
 
 
 class ConvBlock(nn.Module):
