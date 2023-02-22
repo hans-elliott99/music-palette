@@ -1,6 +1,6 @@
 
-from src.utils import quick_color_display, create_patched_input
-from src.models.transformers import ConvTransformer, PatchTransformer
+from src.utils import quick_color_display, create_patched_input, plot_predicted_melspec
+from src.models.transformers import ConvTransformer, PatchTransformer, GPTPatchTransformer
 
 import torch
 import numpy as np
@@ -16,7 +16,7 @@ CHANNELS = 1
 RATE = 44100
 RECORD_SECONDS = 5 ##model-dependent
 device_index = 0
-model_path = "./checkpoints/vit_base.pth"
+model_path = "./checkpoints/gpt_base.pth"
 temp_recording = "_temp.wav"
 
 
@@ -105,9 +105,9 @@ if __name__=="__main__":
     if isinstance(model, (ConvTransformer)):
         mod = "conv"
         block_size = model.max_seq_len
-    elif isinstance(model, (PatchTransformer)):
+    elif isinstance(model, (PatchTransformer, GPTPatchTransformer)):
         mod = "patch"
-        n_patches = 20#model.n_patches
+        n_patches = model.n_patches
     else: 
         raise NotImplementedError("Model type unrecognized.") 
 
@@ -154,16 +154,19 @@ if __name__=="__main__":
             with torch.no_grad():
                 x = create_patched_input(spec_t.squeeze(1), n_patches=20, pad_method="min")
                 print(x.shape)                    #(1, n_patches, feats)
-                logits_flat = model(x)            #(1, n_colors*3)
+                logits_flat = model(x, pretraining=True)            #(1, n_colors*3)
                 logits_flat = logits_flat.unsqueeze(1) #(1, 1, n_colors*3) for consistency w/ conv
 
-        # Do something with the color palette
+        if True: #generative pretraining
+            plot_predicted_melspec(spec_t[0][0].cpu(), logits_flat[0].cpu(), figsize=(12,10))
 
+        # Do something with the color palette
         ## Let's plot the most recent mel and the most recently generated palette
-        mel = spec_t.reshape((128, 157, 1))
-        print(logits_flat[0, -1, :] * 255)
-        plot_palette_with_melspec(logits_flat[:, -1, :], model.n_colors, mel)
-        plt.show()
+        if False:
+            mel = spec_t.reshape((128, 157, 1))
+            print(logits_flat[0, -1, :] * 255)
+            plot_palette_with_melspec(logits_flat[:, -1, :], model.n_colors, mel)
+            plt.show()
 
 
     p.terminate()
