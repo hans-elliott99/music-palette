@@ -6,6 +6,9 @@ import json
 import math
 import pandas as pd
 import matplotlib.pyplot as plt
+import librosa
+
+#TODO[s] undone
 
 # MISC ------------------------------------------------------------------------
 def quick_color_display(rgb:list, h=30, w=30):
@@ -16,6 +19,20 @@ def quick_color_display(rgb:list, h=30, w=30):
     block[:,:,:] = rgb
     return block.astype(np.uint8)
 
+
+def wav_to_melspec(wav_path,
+                    sample_rate=16000, n_mels=128, 
+                    n_fft=2048, hop_length=512):
+    # create mel-spectorgram
+    y, sr = librosa.load(wav_path, sr=sample_rate)
+    spec = librosa.feature.melspectrogram(y=y, sr=sr,
+                                        n_mels=n_mels, 
+                                        n_fft=n_fft,
+                                        hop_length=hop_length)
+    # convert to log scale (dB scale)
+    log_spec = librosa.amplitude_to_db(spec, ref=1.)
+    log_spec = log_spec[np.newaxis, ...] #add Channel dim
+    return log_spec
 
 def plot_predicted_melspec(true_melspec, pred_array, savename=None, **kwargs):
     """
@@ -120,15 +137,17 @@ def redmean_rgb_dist(pred_tensor:torch.tensor, truth_tensor:torch.tensor, scale_
 # TRAINING UTILS --------------------------------------------------------------
 
 #TODO: allow for patching in the time AND frequency direction - see https://arxiv.org/pdf/2110.05069v3.pdf
-def create_patched_input(X:torch.tensor, n_patches:int=8, pad_method:str="zero"):
+def create_patched_input(X:torch.tensor, n_patches:int=8, pad_method:str="zero", flatten:bool=True):
     """X.shape = (?, Channels, Height/Features, Width/Time) 
     Returns tensor of shape (?, n_patches, Channels, Height, feats_per_patch) where
     feats_per_patch = (W // n_patches) + 1 if W % n_patches != 0 , or
                     = W // n_patches if W % n_patches == 0  
     """
     device = X.device
+    batched = True
     if len(X.shape) == 3:
         X = X.unsqueeze(0)
+        batched = False
     b, C, H, W = X.shape
     feats_per_patch = W // n_patches
     pad_array = None
@@ -153,7 +172,12 @@ def create_patched_input(X:torch.tensor, n_patches:int=8, pad_method:str="zero")
             pad_array = pad_array.to(device)
             patch = torch.cat([patch, pad_array], axis=-1)
         t[:, i] = patch
-    return t.flatten(-3,-1) #(batch, n_patches, feats)
+    
+    if flatten:
+        t = t.flatten(-3,-1) #(batch, n_patches, feats)
+    if not batched:
+        t = t.squeeze(0)
+    return t
 
 
 def pick_highest_luminance(y_array):
@@ -163,14 +187,44 @@ def pick_highest_luminance(y_array):
     https://en.wikipedia.org/wiki/Relative_luminance
     Returns an array of shape (sequence_length, 1, 3) given (sequence_length, N_colors, 3).
     """
-    y_out = np.zeros((y_array.shape[0], 1, 3), dtype=np.float32) # seq_len, 1 color, rgb
-    lum_coef = np.array([[0.2126], [0.7152], [0.0722]]) #3,1
+    no_seq = False
+    if len(y_array.shape) == 2:
+        no_seq = True
+        y_array = y_array.unsqueeze(0) #add sequence/batch dimension if there is none
+    y_out = torch.zeros((y_array.shape[0], 1, 3), dtype=torch.float32) # seq_len, 1 color, rgb
+    lum_coef = torch.tensor([[0.2126], [0.7152], [0.0722]]) #3,1
     # mat mul w lum coefs to get the highest perceived luminance of all colors in palette (applied per-palette)
     y_lum = y_array @ lum_coef #5,5,3 @ 3,1 = 5,5,1
-    inds = np.argmax(y_lum, axis=1).flatten()
+    inds = torch.argmax(y_lum, axis=1).flatten()
     for i, ix in enumerate(inds):
         y_out[i, :] = y_array[i, ix, :]
+    if no_seq:
+        y_out = y_out.squeeze(0)
     return y_out
+
+
+def update_dropout_p(model:object, config:dict, verbose=True):
+    dropouts = {"embed_dropout":None, "attn_dropout":None, "resid_dropout":None, "mlp_dropout":None}
+    for attr in dropouts.keys():
+        old_val = getattr(model, attr)
+        if old_val != config[attr]:
+            setattr(model, attr, config[attr])
+            if verbose:
+                print(f"Updating {attr} from {old_val} to {config[attr]}.")
+        dropouts[attr] = config[attr]
+
+    for name, param in model.named_modules():
+        if "embed_drop" in name or "proj_drop" in name:
+            param.p = dropouts["embed_dropout"]
+        elif "attn_drop" in name:
+            param.p = dropouts["attn_dropout"]
+        elif "resid_drop" in name:
+            param.p = dropouts["resid_dropout"]
+        elif "mlp_drop" in name or "mlp.net.3" in name:   #TODO: mlp.net.3 is left for back-compat.
+            param.p = dropouts["mlp_dropout"]
+    
+    return model
+
 
 def save_model_with_shape(model, 
                           save_dir, save_name="checkpoint", 
