@@ -5,6 +5,7 @@ class Config(ABC):
 
     @abstractmethod
     def __init__(self) -> None:
+        # derived classes must define an init method
         pass
 
     def check_required(self, required_keys) -> None:
@@ -18,10 +19,7 @@ class Config(ABC):
             yield attr, value
 
     def to_dict(self):
-        out = {}
-        for attr, value in self:
-            out[attr] = value
-        return out
+        return {attr: value for attr, value in self}
 
 
 """
@@ -42,10 +40,10 @@ Patch-Model Params
     linear_layers: List or Tuple. Hidden dimensions of the linear projection layers which project the flattened patch features
                     into the desired dimension D. The last element of linear_layers is D, the latent space dimension / hidden size for the
                     transformer network. It must be divisible by n_heads.
-    n_freq_bins  : Int of None. The number of bins to use when creating frequency embeddings. If None, frequency embeddings are not used.
-    n_time_bins  : Int of None. The number of bins to use when creating time embeddings. If None, frequency embeddings are not used.
-                   (Note: time embeddings embed across the features of each patch. They differ from position embeddings, which encode 
-                    the relative positions of items in a sequence.) 
+    n_freq_bins  : Int or None. The number of bins to use when creating frequency embeddings. If None, frequency embeddings are not used.
+    n_time_bins  : Int or None. The number of bins to use when creating time embeddings. If None, frequency embeddings are not used.
+                   (Note: time embeddings embed across the features of each individual patch. They differ from position embeddings, which encode 
+                    the relative positions of items in a sequence, such as a sequence of patches.) 
 """
 
 
@@ -68,6 +66,44 @@ class GPTPatchTrfmrBasicConfig(Config):
 
         assert self.linear_layers[-1] % self.n_heads == 0, f"D={self.linear_layers[-1]} is not divisible by {self.n_heads} heads."
 
+
+class GPTPatchTrfmrRegConfig(Config):
+    def __init__(self) -> None:
+        super().__init__()
+        self.n_colors       = 1
+        self.n_patches      = 20
+        self.n_freq_bins    = 128
+        self.n_time_bins    = None
+        self.linear_layers  = [8*64, 8*32]
+        self.n_heads        = 8
+        self.n_trfmr_layers = 12 
+        self.embed_dropout  = 0.25
+        self.attn_dropout   = 0.0
+        self.resid_dropout  = 0.1
+        self.mlp_dropout    = 0.25
+        self.check_required(GPTPatchTransformer.get_empty_config())
+
+        assert self.linear_layers[-1] % self.n_heads == 0, f"D={self.linear_layers[-1]} is not divisible by {self.n_heads} heads."
+
+
+
+class GPTPatchTrfmrFineTuneConfig(Config):
+    def __init__(self) -> None:
+        super().__init__()
+        self.n_colors       = 1
+        self.n_patches      = 20
+        self.n_freq_bins    = 128
+        self.n_time_bins    = None
+        self.linear_layers  = [8*32]
+        self.n_heads        = 8
+        self.n_trfmr_layers = 8 
+        self.embed_dropout  = 0.5
+        self.attn_dropout   = 0.5
+        self.resid_dropout  = 0.5
+        self.mlp_dropout    = 0.5
+        self.check_required(GPTPatchTransformer.get_empty_config())
+
+        assert self.linear_layers[-1] % self.n_heads == 0, f"D={self.linear_layers[-1]} is not divisible by {self.n_heads} heads."
 
 # ---------------------- Patch Transformer Configs -------------------------- #
 class ViTDefaultForPatchTrfmr(Config):

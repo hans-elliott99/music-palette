@@ -58,10 +58,10 @@ class MLP_Trfmr(nn.Module):
     def __init__(self, in_feats, hidden_ratio=4, dropout=0.):
         #default in_feats*4, as in Attention is All You Need & An Image Is Worth 16X16 Words (ViT)
         super().__init__()
-        self.linear_in  = nn.Linear(in_feats, hidden_ratio*in_feats), 
-        self.gelu       = nn.GELU(),
+        self.linear_in  = nn.Linear(in_feats, hidden_ratio*in_feats)
+        self.gelu       = nn.GELU()
             # project back into residual pathway
-        self.linear_out = nn.Linear(hidden_ratio*in_feats, in_feats),
+        self.linear_out = nn.Linear(hidden_ratio*in_feats, in_feats)
         self.mlp_dropout= nn.Dropout(dropout)
 
     def forward(self, x):

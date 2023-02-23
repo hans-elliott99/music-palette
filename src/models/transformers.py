@@ -9,7 +9,8 @@ from src.models.modules import TfmrBlock, ConvBlock, LinearProjection
 
 #TODO: Time embeddings are rudimentary, need to better index which pixels are from which time bin
 #TODO: Determine best pooling method/implement others for transformer encoders. https://github.com/lucidrains/vit-pytorch/tree/main/vit_pytorch
-#TODO: Implemen "patch-out": https://github.com/kkoutini/PaSST
+#TODO: Implement "patch-out": https://github.com/kkoutini/PaSST
+#TODO: Add parameter groups for easier fine-tuning/lr-groups
 # --------------------------------------------------------------------------- #
 #                      GENERATIVE PATCH TRANSFORMER                           #
 # --------------------------------------------------------------------------- #
@@ -74,22 +75,23 @@ class GPTPatchTransformer(nn.modules.Module):
             self.input_shape = X_shape
         N_patches, N_features = self.input_shape #spectrogram input shape
 
-        # LAYERS
-        self.ln_0 = nn.LayerNorm(N_features)
 
+        # EMBEDDINGS
+        embed_layers = []
         # Patch Embeddings
         # Linear Layers to Project to Constant Latent Vector Size
         if self.linear_layers:
             if not isinstance(self.linear_layers, list):
                 self.linear_layers = [self.linear_layers]
-            self.linear_layers = [N_features] + self.linear_layers
+            lin_layers = [N_features] + self.linear_layers
             self.linear_proj = nn.ModuleList([
-                LinearProjection(in_feats=self.linear_layers[i],
-                                 out_feats=self.linear_layers[i+1],
+                LinearProjection(in_feats=lin_layers[i],
+                                 out_feats=lin_layers[i+1],
                                  dropout=0.,
-                                 bias=False) for i in range(len(self.linear_layers)-1)
+                                 bias=False) for i in range(len(lin_layers)-1)
             ])
-            n_feats = self.linear_layers[-1]
+            n_feats = lin_layers[-1]
+            embed_layers.append(self.linear_proj)
         else:
             self.linear_proj = None
             n_feats = N_features
@@ -99,6 +101,7 @@ class GPTPatchTransformer(nn.modules.Module):
             # freqs normalized to -1, 1.. add small value to avoid boundaries not being included 
             self.freq_bins  = torch.linspace(-1.01, 1.01, self.n_freq_bins)
             self.freq_embed = nn.Embedding(num_embeddings=self.n_freq_bins, embedding_dim=n_feats)
+            embed_layers.append(self.freq_embed)
         else:
             self.freq_bins  = None
             self.freq_embed = None
@@ -108,15 +111,16 @@ class GPTPatchTransformer(nn.modules.Module):
         if self.n_time_bins is not None:
             self.time_bins  = torch.arange(0, self.n_time_bins)
             self.time_embed = nn.Embedding(num_embeddings=self.n_time_bins, embedding_dim=n_feats)
+            embed_layers.append(self.time_embed)
         else:
             self.time_bins  = None
             self.time_embed = None
 
         # Standard Positional/Patch Embeddings
+        self.ln_0 = nn.LayerNorm(N_features) #applied before projection
         self.pos_embed = nn.Embedding(num_embeddings=N_patches, embedding_dim=n_feats)
-
-        # Embedding dropout
         self.embed_drop = nn.Dropout(self.embed_dropout)
+        embed_layers += [self.ln_0, self.pos_embed, self.embed_drop]
 
         # Transformer Blocks
         self.transformer = nn.ModuleList([
@@ -137,6 +141,13 @@ class GPTPatchTransformer(nn.modules.Module):
         self.head_ln_clf = nn.LayerNorm(n_feats)
         self.head_dense_clf = nn.Linear(in_features=n_feats,
                                      out_features=self.n_colors*3)
+
+        # Optimization Groups
+        self.groups = nn.ModuleDict({
+            "embeddings" : nn.ModuleList(embed_layers),
+            "transformers" : nn.ModuleList(self.transformer),
+            "heads" : nn.ModuleList([self.head_ln_pt, self.head_dense_pt, self.head_ln_clf, self.head_dense_clf])
+        })
 
         # apply weight init
         self.init_weights()
@@ -245,7 +256,6 @@ class GPTPatchTransformer(nn.modules.Module):
 # --------------------------------------------------------------------------- #
 #                        PATCHED VISION TRANSFORMER                           #
 # --------------------------------------------------------------------------- #
-#TODO: Time embeddings are rudimentary, need to better index which pixels are from which time bin
 class PatchTransformer(nn.modules.Module):
     """
     Inputs are shape (n_patches, C, H, W_per_patch).
@@ -313,12 +323,12 @@ class PatchTransformer(nn.modules.Module):
         if self.linear_layers:
             if not isinstance(self.linear_layers, list):
                 self.linear_layers = [self.linear_layers]
-            self.linear_layers = [N_features] + self.linear_layers
+            lin_layers = [N_features] + self.linear_layers
             self.linear_proj = nn.ModuleList([
-                LinearProjection(in_feats=self.linear_layers[i],
-                                 out_feats=self.linear_layers[i+1],
+                LinearProjection(in_feats=lin_layers,
+                                 out_feats=lin_layers,
                                  dropout=0.,
-                                 bias=False) for i in range(len(self.linear_layers)-1)
+                                 bias=False) for i in range(len(lin_layers)-1)
             ])
             n_feats = self.linear_layers[-1]
         else:
