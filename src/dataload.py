@@ -5,11 +5,14 @@ import librosa
 from pathlib import Path
 import dill
 import time
-from sklearn.model_selection import train_test_split
 import random
 import math
-import torch
 import json
+
+import torch
+import torchaudio
+from torchaudio.transforms import Spectrogram, MelScale, AmplitudeToDB
+import src.utils as utils
 
 class AudioDataManager:
     def __init__(self, audio_folder) -> None:
@@ -143,10 +146,10 @@ def generate_seq_data_arrays(metadata_path,
                     f"Songs converted: {i+1} / {len(samples.groups)} ({(i+1)*100 / len(samples.groups) :.2f}%)")
     print(f"Final songs converted: {i+1}")
 
-
+# Generating individual spectrogram arrays -------------
 def generate_data_arrays(metadata_path,
                          audio_folder,
-                         save_folder  = "./data_arrays",
+                         save_folder,
                          remake_existing = True,
                          #librosa:
                          sample_rate = 16000, ##to load audio as
@@ -154,7 +157,7 @@ def generate_data_arrays(metadata_path,
                          n_fft       = 2048,  ##length of the FFT window
                          hop_length  = 512,   ##number of samples between successive frames
                          verbosity   = 100):
-    """Iterrate through saved WAV files and their corresponding color palettes and save as tuples of np arrays.
+    """Iterate through saved WAV files and their corresponding color palettes and save as tuples of np arrays.
     """
 
     os.makedirs(save_folder, exist_ok=True)
@@ -200,8 +203,8 @@ def generate_data_arrays(metadata_path,
 
 
     
-
-def split_samples_by_song(arraydata_dir, 
+# Splitting data samples -------------------
+def split_samples_by_song(data_dir=None, 
                           audio_dir="./audio_wav", 
                           splitmeta_path="./meta.json",
                           valid_share=0.1,
@@ -215,8 +218,9 @@ def split_samples_by_song(arraydata_dir,
     Otherwise, an existing train-test split (as created by 
     AudioDataManager.create_song_splits) is loaded from 'splitmeta_path'.
 
-    For each split (train, valid, test), returns a list of the filenames within
-    "arraydata_path" which belong to the split.
+    For each split (train, valid, test), returns a list of the filenames which belong to the split.
+    If data_dir is provided, the function assumes that the final data files are stored there.
+    If not provided, it assumes that the audio_dir is the source of the final data files.
     """
     a = AudioDataManager(audio_dir)
 
@@ -232,12 +236,141 @@ def split_samples_by_song(arraydata_dir,
     a.load_song_splits(splitmeta_path)
     a.make_valid_split(valid_share, random_seed=random_seed)
     
-    data_files = os.listdir(arraydata_dir)
+    if data_dir is not None:
+        data_files = os.listdir(data_dir)
+    else:
+        data_files = os.listdir(audio_dir)
     train_paths = [f for f in data_files if int(f.split("_")[0]) in a.train_songs]
     valid_paths = [f for f in data_files if int(f.split("_")[0]) in a.valid_songs]
     test_paths  = [f for f in data_files if int(f.split("_")[0]) in a.test_songs]
 
     return train_paths, valid_paths, test_paths
+
+
+# Modify X or Y in the dataloader
+class TransformX:
+    def __init__(self, n_patches, pad_method, spec_aug, flatten_patches) -> None:
+        self.n_patches = n_patches
+        self.pad_method = pad_method
+        self.spec_aug = spec_aug
+        self.flatten_patches = flatten_patches
+    def __call__(self, X):
+        # normalize spectrogram to [-1, 1]
+        if self.spec_aug:
+            X /= 100.
+        else:
+            X /= torch.amax(torch.abs(X))
+        return utils.create_patched_input(X, self.n_patches, self.pad_method, self.flatten_patches)
+
+class TransformY:
+    def __init__(self, n_colors) -> None:
+        self.n_colors = n_colors
+    def __call__(self, y):
+        if self.n_colors==1:
+            y = utils.pick_highest_luminance(y)
+        return y / 255. #scale to [0, 1]
+
+
+# Torch Datasets ------------------------------
+class AudioToSpecDataset(torch.utils.data.Dataset):
+    def __init__(self,
+                 audio_paths_list:str,
+                 audio_data_dir:str,
+                 audio_color_map:dict=None,
+                 X_transform=None,
+                 y_transform=None,
+                 spec_augment=None,
+                 # mel-spec params: default -> shape(1,128,160) mel-spec
+                 n_fft:int=2048,
+                 n_mels:int=128,
+                 resample_freq:int=16000,
+                 hop_length:int=501,
+                 mono_wav:bool=True
+                 ) -> None:
+        """PyTorch Dataset which loads .WAV clips and prepares them as MelSpectrograms.
+
+        spec_aug = torch.nn.Sequential(
+            TimeStretch(stretch_factor, fixed_rate=True),
+            FrequencyMasking(freq_mask_param=80),
+            TimeMasking(time_mask_param=80),
+        )
+        """
+        super().__init__()
+        self.paths_list = audio_paths_list
+        self.data_dir = Path(audio_data_dir)
+        self.audio_color_map = audio_color_map
+
+        self.X_transform = X_transform
+        self.y_transform = y_transform
+        
+        self.n_fft = n_fft
+        self.n_mels = n_mels
+        self.resample_freq = resample_freq
+        self.mono = mono_wav
+        self.hop_length = hop_length
+        if self.hop_length is None:
+            self.hop_length = n_fft // 2
+
+        self.spec = Spectrogram(n_fft=n_fft, power=2, hop_length=self.hop_length)
+        self.spec_aug = spec_augment
+        self.mel_scale = MelScale(n_mels=self.n_mels,
+                                  sample_rate=self.resample_freq, 
+                                  n_stft=self.n_fft // 2 + 1)
+        self.amp_to_db = AmplitudeToDB()
+
+    def __len__(self):
+        return len(self.paths_list)
+
+    def __getitem__(self, idx):
+        wav_file  = self.paths_list[idx]
+        audiopath = self.data_dir / Path(wav_file)
+
+        # get X
+        wav, sr = torchaudio.load(audiopath, normalize=True)
+        if self.mono:
+            wav = torch.mean(wav, dim=0).unsqueeze(0)
+        wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=self.resample_freq)
+        spec = self.spec(wav)
+        X = self.amp_to_db(self.mel_scale(spec))
+        if self.spec_aug:
+            spec = self.spec_aug(spec)
+        X_aug = self.amp_to_db(self.mel_scale(spec))
+
+        # get Y
+        y = None
+        if self.audio_color_map is not None:
+            y = self.audio_color_map[wav_file]
+            y = torch.tensor(np.array(y, dtype=np.float32))
+
+        X = self.preprocess_spec(X)
+        X_aug = self.preprocess_spec(X_aug)
+        y = self.preprocess_pal(y)
+        return X, X_aug, y
+
+    @staticmethod
+    def gen_audio_color_map(metadata_path):
+        ac_map = {}
+        meta = pd.read_csv(metadata_path)
+        for i, row in meta.iterrows():
+            wav_file = row["audio_clip"]
+            pal = []
+            for k in row.keys():
+                if k.startswith("rgb"):
+                    rgb = [int(c) for c in row[k].split()]
+                    pal.append(rgb)
+
+            ac_map[wav_file] = pal
+        return ac_map
+
+    def preprocess_spec(self, X):
+        if self.X_transform is not None:
+            X = self.X_transform(X)
+        return X
+
+    def preprocess_pal(self, y):
+        if self.y_transform is not None:
+            y = self.y_transform(y)
+        return y
 
 
 
