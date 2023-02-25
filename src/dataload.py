@@ -8,11 +8,18 @@ import time
 import random
 import math
 import json
+import wave
 
 import torch
 import torchaudio
 from torchaudio.transforms import Spectrogram, MelScale, AmplitudeToDB
 import src.utils as utils
+
+def youtube_filename_parser(audio_path:str):
+    return int(audio_path.split("_")[0])
+
+def gtzan_filename_parser(audio_path:str):
+    return '_'.join(audio_path.split("_")[0:2]) 
 
 class AudioDataManager:
     def __init__(self, audio_folder) -> None:
@@ -21,8 +28,10 @@ class AudioDataManager:
         self.valid_songs = None
         self.test_songs = None
 
-    def create_song_splits(self, test_share, metadata_path="./meta.json", random_seed=123):
-        unique_songs = list(set(int(s.split("_")[0]) for s in os.listdir(self.audio_folder)))
+    def create_song_splits(self, test_share, filename_parser, metadata_path="./meta.json", random_seed=123):
+        unique_songs = list(set(
+            filename_parser(s) for s in os.listdir(self.audio_folder)
+            ))
         random.Random(random_seed).shuffle(unique_songs)
 
         meta = {}
@@ -202,11 +211,82 @@ def generate_data_arrays(metadata_path,
                     f"Clips converted: {i+1} / {meta.shape[0]} ({(i+1)*100 / meta.shape[0] :.2f}%)")
 
 
-    
+# Split WAV files into smaller clips
+def split_wave(path:str, clip_duration:int, max_wav_len:int, naming_function, save_dir:str):
+    """Split one wave file into smaller/shorter files.
+    path: path to the wave file.
+    clip_duration: the duration in seconds of each clip
+    max_wav_len: the estimated length in seconds of the wave clip (for example, 30 seconds for GTZAN data).
+    naming_function: a function which receives and parses 'path' as a str and 'idx' as an int and returns a
+                     new str which will be the name of the saved clip.
+    save_dir: directory to save the clips to.
+    """
+    path = Path(path)
+    save_dir = Path(save_dir)
+    # Read audio in as smaller clips
+    clips = []
+    with wave.open(path.as_posix()) as infile:
+        nchannels = infile.getnchannels()
+        sampwidth = infile.getsampwidth()
+        framerate = infile.getframerate()
+
+        for i in range(0, int(max_wav_len/clip_duration)):
+            start = i*clip_duration
+            stop  = (i+1)*clip_duration
+            infile.setpos(int(start*framerate))
+            data = infile.readframes(int((stop-start) * framerate))
+            clips.append(data)
+
+    # Write each clip to a WAV file
+    for i in range(len(clips)):
+        f = save_dir / Path(naming_function(path.as_posix(), i))
+        with wave.open(f.as_posix(), 'w') as outfile:
+            outfile.setnchannels(nchannels)
+            outfile.setsampwidth(sampwidth)
+            outfile.setframerate(framerate)
+            outfile.setnframes(int(len(clips[i]) / sampwidth))
+            outfile.writeframes(clips[i])    
+
+
+def generate_gtzan_clipname(path:str, idx:int):
+    name = path.replace("\\", "/").split("/")[-1].split(".")
+    genre, sample_id = name[0], name[1]
+    return f"{genre}_{sample_id}_{idx}.wav"
+
+def chunk_gtzan(gtzan_genre_parentdir:str, save_dir:str, clip_duration):
+    """
+    python -c "from src.dataload import chunk_gtzan; chunk_gtzan('./data/gtzan/genres_original/', './data/gtzan/genres_clipped', 5);"
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    max_wav_len = 30 #GTZAN samples are 30 seconds each
+    genrefolders = Path(gtzan_genre_parentdir)
+    count = {}
+    for genre in genrefolders.iterdir():
+        g = genre.as_posix().split("/")[-1]
+        count[g] = 0
+        for sample in genre.iterdir():
+            count[g] += 1
+            if all([
+                os.path.exists(generate_gtzan_clipname(sample.as_posix(), i)) for i in range(int(max_wav_len/clip_duration))
+                ]):
+                continue
+            try:
+                split_wave(sample, 
+                        clip_duration=5, max_wav_len=30,
+                        naming_function=generate_gtzan_clipname,
+                        save_dir=save_dir)
+            except Exception as e:
+                print(f"ERROR- Sample: {sample}")
+                print(e)
+        print(f"Genre {g} complete. Files processed: {count[g] :,}. Files saved: {count[g] * int(max_wav_len/clip_duration) :,}")
+
+
+
 # Splitting data samples -------------------
-def split_samples_by_song(data_dir=None, 
-                          audio_dir="./audio_wav", 
-                          splitmeta_path="./meta.json",
+def split_samples_by_song(audio_dir, 
+                          splitmeta_path,
+                          filename_parser,
+                          data_dir=None,
                           valid_share=0.1,
                           test_share=None,
                           random_seed=149):
@@ -230,6 +310,7 @@ def split_samples_by_song(data_dir=None,
         print("Creating new train-test split. Saving song-ids to:", splitmeta_path)
 
         a.create_song_splits(test_share=test_share, 
+                             filename_parser=filename_parser,
                              metadata_path=splitmeta_path,
                              random_seed=random_seed)
 
@@ -240,9 +321,9 @@ def split_samples_by_song(data_dir=None,
         data_files = os.listdir(data_dir)
     else:
         data_files = os.listdir(audio_dir)
-    train_paths = [f for f in data_files if int(f.split("_")[0]) in a.train_songs]
-    valid_paths = [f for f in data_files if int(f.split("_")[0]) in a.valid_songs]
-    test_paths  = [f for f in data_files if int(f.split("_")[0]) in a.test_songs]
+    train_paths = [f for f in data_files if filename_parser(f) in a.train_songs]
+    valid_paths = [f for f in data_files if filename_parser(f) in a.valid_songs]
+    test_paths  = [f for f in data_files if filename_parser(f) in a.test_songs]
 
     return train_paths, valid_paths, test_paths
 
@@ -263,16 +344,109 @@ class TransformX:
         return utils.create_patched_input(X, self.n_patches, self.pad_method, self.flatten_patches)
 
 class TransformY:
-    def __init__(self, n_colors) -> None:
-        self.n_colors = n_colors
+    def __init__(self, task:str, **kwargs) -> None:
+        if task.lower().startswith("col"):
+            assert "n_colors" in kwargs.keys(), "The 'color' prediction task requires kwarg n_colors"    
+            self.n_colors = kwargs["n_colors"]
+        elif task.lower().startswith("gen"):
+            self.n_colors = None
+        else:
+            raise NotImplementedError("task must be one of 'color' or 'genre'.")
+
     def __call__(self, y):
         if self.n_colors==1:
             y = utils.pick_highest_luminance(y)
-        return y / 255. #scale to [0, 1]
+            y /= 255. #scale colors [0,1]
+        return y 
 
 
 # Torch Datasets ------------------------------
-class AudioToSpecDataset(torch.utils.data.Dataset):
+class WavToSpecGTZANDataset(torch.utils.data.Dataset):
+    def __init__(self,
+                 audio_paths_list:str,
+                 audio_data_dir:str,
+                 class_encoding:dict,
+                 X_transform=None,
+                 y_transform=None,
+                 spec_augment=None,
+                 # mel-spec params: default -> shape(1,128,160) mel-spec
+                 n_fft:int=2048,
+                 n_mels:int=128,
+                 resample_freq:int=16000,
+                 hop_length:int=501,
+                 mono_wav:bool=True,
+                 **kwargs
+                 ) -> None:
+        """PyTorch Dataset which loads .WAV clips and prepares them as MelSpectrograms.
+           Works with GTZAN data where class labels are in the filenames.
+
+        spec_aug = torch.nn.Sequential(
+            TimeStretch(stretch_factor, fixed_rate=True),
+            FrequencyMasking(freq_mask_param=80),
+            TimeMasking(time_mask_param=80),
+        )
+        """
+        super().__init__()
+        self.paths_list = audio_paths_list
+        self.data_dir = Path(audio_data_dir)
+        self.class_encoding = class_encoding
+
+        self.X_transform = X_transform
+        self.y_transform = y_transform
+        
+        self.n_fft = n_fft
+        self.n_mels = n_mels
+        self.resample_freq = resample_freq
+        self.mono = mono_wav
+        self.hop_length = hop_length
+        if self.hop_length is None:
+            self.hop_length = n_fft // 2
+
+        self.spec = Spectrogram(n_fft=n_fft, power=2, hop_length=self.hop_length)
+        self.spec_aug = spec_augment
+        self.mel_scale = MelScale(n_mels=self.n_mels,
+                                  sample_rate=self.resample_freq, 
+                                  n_stft=self.n_fft // 2 + 1)
+        self.amp_to_db = AmplitudeToDB()
+
+    def __len__(self):
+        return len(self.paths_list)
+
+    def __getitem__(self, idx):
+        wav_file  = self.paths_list[idx]
+        audiopath = self.data_dir / Path(wav_file)
+
+        # get X
+        wav, sr = torchaudio.load(audiopath, normalize=True)
+        if self.mono:
+            wav = torch.mean(wav, dim=0).unsqueeze(0)
+        wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=self.resample_freq)
+        spec = self.spec(wav)
+        X = self.amp_to_db(self.mel_scale(spec))
+        if self.spec_aug:
+            spec = self.spec_aug(spec)
+        X_aug = self.amp_to_db(self.mel_scale(spec))
+
+        # get Y
+        y = torch.tensor( int(self.class_encoding[wav_file.split("_")[0]]) ).long()
+
+        X     = self.preprocess_spec(X)
+        X_aug = self.preprocess_spec(X_aug)
+        y     = self.preprocess_pal(y)
+        return X, X_aug, y
+
+    def preprocess_spec(self, X):
+        if self.X_transform is not None:
+            X = self.X_transform(X)
+        return X
+
+    def preprocess_pal(self, y):
+        if self.y_transform is not None:
+            y = self.y_transform(y)
+        return y
+
+
+class WavToSpecColorDataset(torch.utils.data.Dataset):
     def __init__(self,
                  audio_paths_list:str,
                  audio_data_dir:str,
@@ -285,15 +459,10 @@ class AudioToSpecDataset(torch.utils.data.Dataset):
                  n_mels:int=128,
                  resample_freq:int=16000,
                  hop_length:int=501,
-                 mono_wav:bool=True
+                 mono_wav:bool=True,
+                 **kwargs
                  ) -> None:
         """PyTorch Dataset which loads .WAV clips and prepares them as MelSpectrograms.
-
-        spec_aug = torch.nn.Sequential(
-            TimeStretch(stretch_factor, fixed_rate=True),
-            FrequencyMasking(freq_mask_param=80),
-            TimeMasking(time_mask_param=80),
-        )
         """
         super().__init__()
         self.paths_list = audio_paths_list
