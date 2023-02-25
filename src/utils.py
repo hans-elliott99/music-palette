@@ -7,6 +7,7 @@ import math
 import pandas as pd
 import matplotlib.pyplot as plt
 import librosa
+from sklearn.metrics import f1_score
 
 #TODO[s] undone
 
@@ -92,8 +93,40 @@ def get_audio_color(audio_file:str, audio_color_map_path:str, view=True):
 
 
 # METRICS ----------------------------------------------------------------------
+class Metric:
+    def __init__(self, fn, init_value=0., **fn_kwargs) -> None:
+        self.calculate = fn
+        self.fn_kwargs = fn_kwargs
+        self.batch = RunningMean()
+        self.accum_value = init_value
+
+    def step(self, true, pred) -> None:
+        self.accum_value += self.calculate(true, pred, **self.fn_kwargs)
+    
+    def batch_update(self, scale=1.) -> None:
+        self.batch.update(self.accum_value * scale)
+        self.accum_value = 0.
+
+    def reset(self):
+        self.accum_value = 0.
+        self.batch.reset()
+
+
 @torch.no_grad()
-def rgb_accuracy(pred_tensor, truth_tensor, window_size, scale_rgb=True):
+def class_accuracy(true_idx, preds, is_logits=False):
+    if is_logits:
+        preds = preds.max(axis=1).indices
+    return (preds == true_idx).sum().item() / true_idx.shape[0]
+
+def multiclass_f1score(true_idx, preds, average="macro", is_logits=False):
+    preds = preds.detach().cpu()
+    true_idx = true_idx.cpu()
+    if is_logits:
+        preds = preds.max(axis=1).indices
+    return f1_score(true_idx, preds, average=average, zero_division=0)
+
+@torch.no_grad()
+def rgb_accuracy(truth_tensor, pred_tensor, window_size, scale_rgb=True):
     assert pred_tensor.size(0) == truth_tensor.size(0)
     pred = pred_tensor.clone()
     truth = truth_tensor.clone()
@@ -117,7 +150,7 @@ def rgb_accuracy(pred_tensor, truth_tensor, window_size, scale_rgb=True):
     return batch_sum / (pred.size(0) * pred.size(1) * 3) #batch_size * n_colors * 3[rgb]
 
 @torch.no_grad()
-def redmean_rgb_dist(pred_tensor:torch.tensor, truth_tensor:torch.tensor, scale_rgb=True):
+def redmean_rgb_dist(truth_tensor:torch.tensor, pred_tensor:torch.tensor, scale_rgb=True):
     pred = pred_tensor.clone()
     true = truth_tensor.clone()
     #shapes: (batch_size, n_colors, rgb[3])
@@ -131,7 +164,7 @@ def redmean_rgb_dist(pred_tensor:torch.tensor, truth_tensor:torch.tensor, scale_
     bit_shift = 2**8
     per_palette_loss = \
         torch.sqrt( ((512+rmean)*r2)/bit_shift + 4*g2 + ((767-rmean)*b2)/bit_shift )
-    return torch.mean( torch.sum(per_palette_loss, axis=1) )
+    return torch.mean( torch.sum(per_palette_loss, axis=1) ).item()
 
 
 # TRAINING UTILS --------------------------------------------------------------
@@ -204,7 +237,7 @@ def pick_highest_luminance(y_array):
 
 
 def update_dropout_p(model:object, config:dict, verbose=True):
-    dropouts = {"embed_dropout":None, "attn_dropout":None, "resid_dropout":None, "mlp_dropout":None}
+    dropouts = {"embed_dropout":None, "attn_dropout":None, "resid_dropout":None, "mlp_dropout":None, "head_dropout":None}
     for attr in dropouts.keys():
         old_val = getattr(model, attr)
         if old_val != config[attr]:
@@ -222,7 +255,8 @@ def update_dropout_p(model:object, config:dict, verbose=True):
             param.p = dropouts["resid_dropout"]
         elif "mlp_drop" in name or "mlp.net.3" in name:   #TODO: mlp.net.3 is left for back-compat.
             param.p = dropouts["mlp_dropout"]
-    
+        elif "head_drop" in name:
+            param.p = dropouts["head_dropout"]
     return model
 
 
@@ -297,7 +331,7 @@ def load_json(file):
 
 
 
-def lr_linearwarmup_cosinedecay(iter_1_based, max_lr, min_lr=6e-5, warmup_iters=50, decay_iters=50):
+def lr_linearwarmup_cosinedecay(iter_1_based, max_lr, min_lr, warmup_iters, decay_iters):
     """https://github.com/karpathy/nanoGPT/blob/master/train.py
     """
     # do a linear warmup to max_lr for the first given iters
@@ -305,19 +339,19 @@ def lr_linearwarmup_cosinedecay(iter_1_based, max_lr, min_lr=6e-5, warmup_iters=
         return max_lr * iter_1_based / warmup_iters
     
     # return the min. lr if training continues past specified decay iters
-    if (iter_1_based - warmup_iters) > decay_iters:
+    if iter_1_based > decay_iters:
         return min_lr
 
     # otherwise, do a cosine decay down to min-lr    
     decay_ratio = (iter_1_based - warmup_iters) / (decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
+    assert 0 <= decay_ratio <= 1, "lr_linearwarmup_cosinedecay: bad decay_ratio"
     coef = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) #range 0, 1
     
     return min_lr + coef * (max_lr - min_lr)
 
 
 
-if __name__=="__main__":
+# if __name__=="__main__":
 
-    for i in range(270, 275):
-        get_audio_color(f"temp/{i}_audioclip_0.wav", "audio_color_mapping.csv")
+#     for i in range(270, 275):
+#         get_audio_color(f"temp/{i}_audioclip_0.wav", "audio_color_mapping.csv")
