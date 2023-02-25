@@ -1,24 +1,29 @@
 
 from src.utils import quick_color_display, create_patched_input, plot_predicted_melspec
-from src.models.transformers import ConvTransformer, PatchTransformer, GPTPatchTransformer
+from src.models.transformers import GPTPatchTransformer
 
 import torch
 import numpy as np
 import librosa
 import matplotlib.pyplot as plt
-
+import os
 import pyaudio
 import wave
 
+
+device_index = 0
+model_path = "./checkpoints/gtzan_ft_0.pth"
+task = "genre" #color, genre, or spectrogram
+
+temp_recording = "_temp_.wav"
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 44100
 RECORD_SECONDS = 5 ##model-dependent
-device_index = 0
-model_path = "./checkpoints/gpt_base.pth"
-temp_recording = "_temp.wav"
-
+GTZAN_CLASSES = {"blues":0, "classical":1, "country":2, "disco":3, "hiphop":4,
+                  "jazz":5, "metal":6, "pop":7, "reggae":8, "rock":9}
+i2tgzan = {int(v):k for k,v in GTZAN_CLASSES.items()}
 
 def record_next_clip(pyaudio_stream:pyaudio.Stream, sample_width, wav_filename):
     frames = []
@@ -33,8 +38,6 @@ def record_next_clip(pyaudio_stream:pyaudio.Stream, sample_width, wav_filename):
         wavf.writeframes(b''.join(frames))
 
     return frames
-
-
 
 def convert_to_melspec_tensor(wav_filename,
                             #librosa:
@@ -57,8 +60,15 @@ def convert_to_melspec_tensor(wav_filename,
 def preprocess_spec(log_spec_array):
     # normalize to [-1, 1]
     log_spec_array /= np.max(np.abs(log_spec_array)) 
-    return torch.tensor(log_spec_array).unsqueeze(0).unsqueeze(0) # add batch and time dimensions
+    return torch.tensor(log_spec_array).unsqueeze(0) # add batch and time dimensions
 
+def get_gpt_input(X):
+    # Add "start" patch to top of sequence (-1 tensor of shape (1,1,feats))...
+    # Remove last patch in sequence...
+    # Since model is using one patch to predict the next.
+    batch_size, _, feats = X.shape
+    start_patch = (torch.zeros(batch_size, 1, feats) - 1).to(X.device) #(b, 1, feats)
+    return torch.column_stack( (start_patch, X[:, :-1, :]) )           #(b, n_patches, feats)
 
 def plot_palette(logits_flat, n_colors):
     pal_arr = logits_flat.unsqueeze(0).reshape(n_colors,3) #remove batch dim
@@ -92,25 +102,19 @@ def plot_palette_with_melspec(logits_flat, n_colors, melspec=None):
     plt.imshow(strip)
     # plt.show()
 
-if __name__=="__main__":
+
+
+
+
+
+def main():
     device = torch.device("cpu") #if torch.cuda.is_available() else torch.device("cpu")
     
     # Load in model
     print("loading model")
 
     model = torch.load(model_path, map_location=device)
-    model = model.to(device)
     model.eval()
-
-    if isinstance(model, (ConvTransformer)):
-        mod = "conv"
-        block_size = model.max_seq_len
-    elif isinstance(model, (PatchTransformer, GPTPatchTransformer)):
-        mod = "patch"
-        n_patches = model.n_patches
-    else: 
-        raise NotImplementedError("Model type unrecognized.") 
-
 
     # Record audio
     p = pyaudio.PyAudio()
@@ -131,51 +135,39 @@ if __name__=="__main__":
 
         # Convert audio to mel-spec
         spec_t = convert_to_melspec_tensor(temp_recording)
-        spec_t = preprocess_spec(spec_t) #shape (batch[1], time[1], C, H, W)
+        spec_t = preprocess_spec(spec_t) #shape (batch[1], C, H, W)
+        X = create_patched_input(spec_t, n_patches=20, pad_method="min")
 
-        if mod == "conv":
-            if spec_sequence is None:
-                spec_sequence = spec_t
-            else:
-                # Keep last (block_size-1) specs and append the new one by stacking
-                # on the time dimension (axis=1 or "column stack")
-                spec_sequence = torch.column_stack((
-                    spec_sequence[:, -(block_size-1):, :], 
-                    spec_t
-                )) 
-            
-            spec_sequence.to(device)
-            print(spec_sequence.shape)
-            # Send through model 
+        if task.lower().startswith("spec"):
+            X_gpt = get_gpt_input(X)
             with torch.no_grad():
-                logits_flat = model(spec_sequence) #(1, seq_len, n_colors*3)
+                logits = model(X_gpt, pretraining=True)   #(1, n_feats)
+    
+            plot_predicted_melspec(spec_t[0].cpu(), logits[0].cpu(), figsize=(10,8))
 
-        elif mod == "patch":
+        elif task.lower().startswith("color"): #generative pretraining
             with torch.no_grad():
-                x = create_patched_input(spec_t.squeeze(1), n_patches=20, pad_method="min")
-                print(x.shape)                    #(1, n_patches, feats)
-                logits_flat = model(x, pretraining=True)            #(1, n_colors*3)
-                logits_flat = logits_flat.unsqueeze(1) #(1, 1, n_colors*3) for consistency w/ conv
-
-        if True: #generative pretraining
-            plot_predicted_melspec(spec_t[0][0].cpu(), logits_flat[0].cpu(), figsize=(12,10))
-
-        # Do something with the color palette
-        ## Let's plot the most recent mel and the most recently generated palette
-        if False:
+                logits = model(X)
+            # Do something with the color palette
+            ## Let's plot the most recent mel and the most recently generated palette
             mel = spec_t.reshape((128, 157, 1))
-            print(logits_flat[0, -1, :] * 255)
-            plot_palette_with_melspec(logits_flat[:, -1, :], model.n_colors, mel)
+            plot_palette_with_melspec(logits, int(model.n_classes/3), mel)
             plt.show()
-
+        
+        elif task.lower().startswith("genre"):
+            with torch.no_grad():
+                logits = model(X)
+            pred = logits.max(1).indices
+            print(f"Predicted Genre: {i2tgzan[pred.item()]}")
 
     p.terminate()
- 
+    os.remove(temp_recording)
 
-# when to resume recording again? immediately after inference or after some time has passed?
-# how often to reset the hidden state?
-
-
-
+if __name__=="__main__":
+    try:
+        main()
+    except KeyboardInterrupt as e:
+        print("KeyboardInterrupt: Exiting gracefully.")
+        os.remove(temp_recording)
 
     
