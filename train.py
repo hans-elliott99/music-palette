@@ -2,7 +2,9 @@
 import os
 import sys
 import time
+import copy
 import random
+import collections
 import wandb 
 from dotenv import dotenv_values
 
@@ -12,15 +14,21 @@ import torch.nn as nn
 from torchaudio.transforms import FrequencyMasking, TimeMasking
 
 import src.utils as utils
-from src.dataload import split_samples_by_song, AudioToSpecDataset, TransformX, TransformY
-from src.models.transformers import PatchTransformer, GPTPatchTransformer
+import src.dataload as dataload
+from src.dataload import TransformX, TransformY, WavToSpecColorDataset, WavToSpecGTZANDataset
+from src.models.transformers import SpecPatchGPT
 import src.models.configs as configs
 
 
-PATCH_BASED_MODELS = (PatchTransformer, GPTPatchTransformer)
+PATCH_BASED_MODELS = (SpecPatchGPT)
 
 def get_gpt_input(X):
-    """X.shape == (batch_size, num_patches, num_feats)
+    """Get input for generative/autoregressive pretraining.
+
+    :param torch.tensor X: The natural input to the model. 
+        X.shape = (batch_size, num_patches, num_feats)
+    :return: A tensor which has been shifted forward one patch, or time-step.
+    :rtype: torch.tensor
     """
     # Add "start" patch to top of sequence (-1 tensor of shape (1,1,feats))...
     # Remove last patch in sequence...
@@ -30,46 +38,64 @@ def get_gpt_input(X):
     return torch.column_stack( (start_patch, X[:, :-1, :]) )           #(b, n_patches, feats)
 
 
-def patchtransformer_update(X, X_aug, y, model, criterion, config):
-
+def patchtransformer_update(X, X_aug, y, model, criterion, config, metrics):
+    """Complete one forward-pass of the patch-transformer model.
+    """
     batch_size = X.shape[0]
+
+    # Use the augmented spectrogram randomly (but not if in eval mode)
+    if random.random() < config["spec_aug_p"] and model.training:
+        X_in = X_aug
+    else:
+        X_in = X
 
     # FORWARD PASS    
     if config["pretraining"]:
         # predicting X using lagged X, which may be augmented.
-        X_aug_lag = get_gpt_input(X_aug)                  #(b, n_patches, feats)
-        logits = model(X_aug_lag, pretraining=True)  #(b, n_patches, feats)
-        loss = criterion(logits, X)
-
+        X_lag = get_gpt_input(X_in)                  #(b, n_patches, feats)
+        logits = model(X_lag, pretraining=True)  #(b, n_patches, feats)
+        loss = criterion(logits, X) #evaluate with unaugmented spec
     else:
-        logits_flat = model(X) #(b, n_colors*3)     
-        logits_mat = logits_flat.reshape(batch_size, model.n_colors, 3) #(b, n_colors, rgb[3])
+        if config["task"] == "color":
+            n_colors = int(model.n_classes / 3)
+            logits_flat = model(X_in)      #(b, n_colors*3)     
+            logits_mat = logits_flat.reshape(batch_size, n_colors, 3) #(b, n_colors, rgb[3])
 
-        truth_mat = y[:, :model.n_colors, :]           #(b, n_colors, 3)
-        truth_flat = truth_mat.reshape(batch_size, -1) #(b, n_colors*3)
-        loss = criterion(logits_flat, truth_flat)
+            truth_mat = y[:, :n_colors, :]                 #(b, n_colors, 3)
+            truth_flat = truth_mat.reshape(batch_size, -1) #(b, n_colors*3)
+            loss = criterion(logits_flat, truth_flat)
+            # for metrics, use "_mat" shaped tensors
+            truths = truth_mat
+            logits = logits_mat
+
+        elif config["task"] == "genre":
+            logits = model(X_in)
+            loss = criterion(logits, y)
+            truths = y 
 
     # Calc metrics
-    if config["pretraining"]:
-        rgb_dist = rgb_acc = 0
-    else:
-        rgb_dist = utils.redmean_rgb_dist(logits_mat, truth_mat, scale_rgb=True).item()
-        rgb_acc  = utils.rgb_accuracy(logits_mat, truth_mat, scale_rgb=True, window_size=10)
-
-    return loss, rgb_acc, rgb_dist
+    for k in metrics.keys():
+        metrics[k].step(truths, logits)
+    return loss, metrics
 
 
-def batched_trainloop(train_dataloader, model, criterion, optimizer, config, device, batch_print_freq=10):
+def batched_trainloop(train_dataloader, model, criterion, metrics, optimizer,
+                      config, device, batch_print_freq=10):
+    """Train model using mini-batch gradient descent for one epoch.
+    """
     
     model.train()
-    grad_accum     = config["gradient_accumulation_steps"]
-    n_true_batches = int( len(train_dataloader) / grad_accum )
-    losses, accs, dists, batch_times = (utils.RunningMean() for _ in range(4))
-    effective_batch    = 0
+    for k in metrics.keys():
+        metrics[k].reset()
+    losses, batch_times = (utils.RunningMean() for _ in range(2))
 
-    loss, rgb_acc, rgb_dist = 0, 0, 0
+    grad_accum = config["gradient_accumulation_steps"]
+    n_true_batches = int( len(train_dataloader) / grad_accum )
+    effective_batch = 0
+
     steps_since_update = 0
     time0 = time.time()
+    loss = 0
     for step, (X, X_aug, y) in enumerate(train_dataloader):
 
         # Put data on device
@@ -77,82 +103,91 @@ def batched_trainloop(train_dataloader, model, criterion, optimizer, config, dev
         X_aug = X_aug.to(device)
         y = y.to(device)
 
-
+        # FORWARD
         if isinstance(model, PATCH_BASED_MODELS):
-            loss_, rgbacc_, rgbdist_ = patchtransformer_update(
-                X, X_aug, y, model, criterion, config
+            loss_, metrics = patchtransformer_update(
+                X, X_aug, y, model, criterion, config, metrics
                 )
-            loss     += loss_
-            rgb_acc  += rgbacc_
-            rgb_dist += rgbdist_
+            loss += loss_
 
-        # GRADIENT ACCUMULATION - Simulate larger batch-size by accumulating loss
+        # BACKPROP AND UPDATE
+        # Only if gradient_accumulation_steps have been completed
         steps_since_update += 1
-        if steps_since_update - grad_accum == 0 or step == len(train_dataloader)-1:
+        if (steps_since_update - grad_accum == 0 or
+                step == len(train_dataloader)-1):
 
-            # Backprop
+            # Backprop Update
             loss.backward()
             if config["grad_clip"] != 0.0:
-                nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
+                nn.utils.clip_grad_norm_(model.parameters(), 
+                                         config["grad_clip"])
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
 
-            # Track metrics
+            # Update Batch Metrics
             losses.update(loss.item() / grad_accum)
-            accs.update(rgb_acc / grad_accum)
-            dists.update(rgb_dist / grad_accum)
             batch_times.update(time.time() - time0)
 
-            # Standard Output
-            if (effective_batch+1) % batch_print_freq == 0 or effective_batch in [0, len(train_dataloader)-1]:
-                print(f" [Batch {effective_batch+1}/{ n_true_batches } (et={batch_times.last :.2f}s)]")
-                print(f" \tLoss={losses.last :.5f} \tRGBdist={dists.last :.5f} \tAcc={accs.last :.5f}")
+            for k in metrics.keys():
+                metrics[k].batch_update(scale=1./grad_accum) #update running mean & reset step value
 
-            # Reset
+            # Standard Output
+            if ((effective_batch+1) % batch_print_freq == 0 or
+                 effective_batch in [0, len(train_dataloader)-1]):
+                print(f" [Batch {effective_batch+1}/{ n_true_batches } (et={batch_times.last :.2f}s)]")
+                metric_str = ' \t'.join([
+                    f"{k}={metrics[k].batch.mean :.5f}" for k in metrics.keys()
+                ])
+                print(f" \tLoss={losses.last :.5f} \t{metric_str}")
+            
+            # Reset Batch Stats
             steps_since_update = 0
-            loss, rgb_acc, rgb_dist = 0, 0, 0
+            loss = 0
             time0 = time.time()
+
             effective_batch += 1
 
-
-    return losses, dists, accs
-
+    return losses, metrics
 
 @torch.no_grad()
-def batched_validloop(valid_dataloader, model, criterion, config, device):
-    
+def batched_validloop(valid_dataloader, model, criterion, 
+                      metrics, config, device):
+    """Evaluate the model on the validation set.
+    """
     model.eval()
-    losses, accs, dists = (utils.RunningMean() for _ in range(3))
-    
+    losses = utils.RunningMean()
+    for k in metrics.keys():
+        metrics[k].reset()
+
     for X, X_aug, y in valid_dataloader:
         X = X.to(device)
         X_aug = X_aug.to(device)
         y = y.to(device)
         if isinstance(model, PATCH_BASED_MODELS):
-            loss, rgb_acc, rgb_dist = patchtransformer_update(X, X_aug, y, 
-                                                            model, criterion, config)
-        # Track metrics
+            loss, metrics = patchtransformer_update(X, X_aug, y, 
+                                                    model, criterion, 
+                                                    config, metrics)
         losses.update(loss.item())
-        accs.update(rgb_acc)
-        dists.update(rgb_dist)
-    
-    return losses, dists, accs
+
+    for k in metrics.keys():
+        metrics[k].batch_update(scale=1./len(valid_dataloader))
+    return losses, metrics
 
 @torch.no_grad()
 def end_of_epoch_examples(train_dataset, model, config, device, epoch):
     model.eval()
     idx = random.randint(0, len(train_dataset)-1)
     X, X_aug, y = train_dataset[idx]
-    true_mel = utils.wav_to_melspec(f"{train_dataset.data_dir}/{train_dataset.paths_list[idx]}")
+    true_mel = utils.wav_to_melspec(
+        f"{train_dataset.data_dir}/{train_dataset.paths_list[idx]}")
     true_mel /= np.amax(np.abs(true_mel))
 
     X = X.unsqueeze(0).to(device) #(1, n_patches, feats)
-    X_aug = X_aug.unsqueeze(0).to(device)
     y = y.to(device)              #(1, n_colors*3)
 
     if config["pretraining"]:
-        X_gpt = get_gpt_input(X_aug)
+        X_gpt = get_gpt_input(X)
         pred = model(X_gpt, pretraining=True)
         utils.plot_predicted_melspec(true_mel, 
                                      pred[0].cpu(), 
@@ -160,28 +195,35 @@ def end_of_epoch_examples(train_dataset, model, config, device, epoch):
                                      figsize=(12,10))
         print(" \tNew generated MelSpec saved.")
 
-    elif not config["pretraining"]:
-        pred = model(X) #(1, n_colors*3)
-        print(" \tExample palettes - predicted vs true:")
-        print(f" \t{[round(i,1) for i in (pred[0]*255).tolist()]} | {(y[0]*255).tolist()}")
+    else:
+        if config["task"] == "color":
+            pred = model(X) #(1, n_colors*3)
+            print(" \tExample palettes - predicted vs true:")
+            print(f" \t{[round(i,1) for i in (pred[0]*255).tolist()]} | {(y[0]*255).tolist()}")
+        
+        elif config["task"] == "genre":
+            pred = model(X) #(1, n_classes)
+            pred = pred.max(1).indices.item()
+            print(f" \tEx: Predicted Class = {pred} | True Class: {y.item()}")
 
 
-def resolve_lr(optim, config, **kwargs):
+def resolve_lr(optim, config, step):
     order = config["optim_groups"]
     if any(config['decay_lrs'].values()):
-        print("--updating lrs--")
         # Update lr: pass in the current iter (1-based), relative
         # to starting iter. 
         new_lrs = []
         for i in range(len(optim.param_groups)):
+            param_name = optim.param_groups[i]["name"]
+            assert param_name == order[i], "resolve_lr: Optim groups out of order."
+
             if not config["decay_lrs"][param_name]:
+                # If not decaying this optimizer group, use current lr
                 new_lrs.append(optim.param_groups[i]["lr"])
             else:
-                param_name = optim.param_groups[i]["name"]
-                assert param_name == order[i]
-
+                # Otherwise, update the learning rate
                 lr_new = utils.lr_linearwarmup_cosinedecay(
-                    iter_1_based=kwargs["step"] - kwargs["start_epoch"] + 1, 
+                    iter_1_based=step + 1, 
                     max_lr      =config['lrs'][param_name],
                     min_lr      =config['min_lrs'][param_name],
                     warmup_iters=config['lr_warmup_steps'][param_name],
@@ -193,67 +235,102 @@ def resolve_lr(optim, config, **kwargs):
         new_lrs = [v for v in config["lrs"].values()]
     return optim, new_lrs
 
+def transfer_weights(oldmodel, newmodel):
+    old_state_dict = oldmodel.state_dict() #pretrained model
+    new_state_dict = newmodel.state_dict()
+
+    modded_state_dict = collections.OrderedDict()
+    for k in new_state_dict.keys():
+        if "head" not in k:
+            modded_state_dict[k] = old_state_dict[k]
+        else:
+            modded_state_dict[k] = new_state_dict[k]
+
+    newmodel.load_state_dict(modded_state_dict)
+    return newmodel
+
+
+GTZAN_CLASSES = {"blues":0, "classical":1, "country":2, "disco":3, "hiphop":4,
+                  "jazz":5, "metal":6, "pop":7, "reggae":8, "rock":9}
+
 if __name__=="__main__":
 
     #NOTE:
-    # Generatively pretraining allows the model fine-tuned on the palette task to converge quickly.
-    # However, validation performance is not improved.
-    # So, focus on a more regularized pretraining (dropout, patchout, increasing the amount of data since can train in a generative fashion on unlabeled audio )
-    # and a better labeled fine-tuning dataset.
+    #Try higher weight decay for regualrization.
     # -------------------------USER CONTROL------------------------- #
     seed = 87271
-    AUDIO_DIR      = "./data/pop_videos/audio_wav"
-    AUDIO_COLOR_MAP= "./data/pop_videos/audio_color_mapping.csv"
-    SPLITMETA_PATH = "./data/pop_videos/train_test_songs.json"
+    task = "genre" #genre or color
+    AUDIO_DIR      = "./data/pop_videos/audio_wav" if task=="color" else "./data/gtzan/genres_clipped"
+    AUDIO_COLOR_MAP= "./data/pop_videos/audio_color_mapping.csv" if task=="color" else None
+    SPLITMETA_PATH = "./data/pop_videos/train_test_songs.json" if task == "color" else "./data/gtzan/train_test_songs.json"
     
     LOG_WANDB       = True
     SAVE_CHECKPOINT = True
-    WANDB_RUN_GROUP = "GPTPatchTransformer"
+    WANDB_RUN_GROUP = "GPTPatchTransformer_GTZAN"
     CONTINUE_RUN    = True
 
-    MODEL_SAVE_NAME        = "gpt_reg"
-    LOAD_CHECKPOINT        = f"./checkpoints/{MODEL_SAVE_NAME}.pth" #will be created if doesnt exist
-    LOAD_CHECKPOINT_CONFIG = f"./checkpoints/{MODEL_SAVE_NAME}_config.json"
+    MODEL_SAVE_NAME   = "gtzan_ft_0"
+    MODEL_SAVE_DIR    = "./checkpoints"
+    load_model_name   = "" or MODEL_SAVE_NAME
+    CHECKPOINT        = f"./checkpoints/{load_model_name}.pth" #will be created if doesnt exist
+    CHECKPOINT_CONFIG = f"./checkpoints/{load_model_name}_config.json"
 
-    MODEL_CLASS  = GPTPatchTransformer
-    MODEL_CONFIG = configs.GPTPatchTrfmrRegConfig
-    DATALOADER   = AudioToSpecDataset
+    MODEL_CLASS  = SpecPatchGPT
+    MODEL_CONFIG = configs.SPGPTFinetune
 
-    epochs = 10
+    epochs = 100
     batch_size = 32 #effective batch size is _*grad_accumulation_steps
     config = {
         # Training specs
+        "task"       : "genre",
+        "n_colors"   : 1, #for training the color task
         "batch_size" : batch_size,
         "epochs"     : epochs,
-        "pretraining"  : True,
-        "spec_aug"  : True, #augment spectrograms
-        "freeze_embeddings" : False,
-        "freeze_transformer": False,
-        "freeze_head"  : True,
+        "pretraining" : False,
+        "spec_aug"    : True, #augment spectrograms
+        "spec_aug_p"  : 0.80, #percentage of time to use augmented specs
 
         # Utilities
         "batch_print_freq" : 30,
         "checkpoint_save_freq" : None,
         "num_workers" : 2, #for data-loading
 
-        # Optimizer
+        # Optimization
         "optim_groups" : ["embeddings", "transformers", "heads"],
-        "lrs" : {"embeddings":3e-6, "transformers":3e-6, "heads":3e-6}, #also the max lrs if decay_lr==True
+        "freeze_groups": [True, False, False],
+        "lrs" : {"embeddings":6e-4, "transformers":6e-4, "heads":6e-4}, #also the max lrs if decay_lr==True
         "betas" : (0.9, 0.999),
-        "grad_clip" : 1.0,     #disabled if 0
-        "weight_decay" : 3e-5,
+        "grad_clip" : 1.0, #disabled if 0
+        "weight_decay" : 1e-1,
         "gradient_accumulation_steps" : 1, #to simulate larger batch-sizes
 
         # LR Scheduling
-        "decay_lrs" : {"embeddings":False, "transformers":False, "heads":False},
-        "min_lrs" : {"embeddings":3e-5, "transformers":3e-5, "heads":3e-5},
-        "lr_warmup_steps" : {"embeddings":10, "transformers":10, "heads":10},
-        "lr_decay_steps" : {"embeddings":epochs-10, "transformers":epochs-10, "heads":epochs-10}
+        "decay_lrs" : {"embeddings":True, "transformers":True, "heads":True},
+        "min_lrs" : {"embeddings":6e-5, "transformers":6e-5, "heads":6e-5},
+        "lr_warmup_steps" : {"embeddings":5, "transformers":5, "heads":5},
+        "lr_decay_steps" : {"embeddings":epochs-5, "transformers":epochs-5, "heads":epochs-5}
     }
-
+    
     config = { **MODEL_CONFIG().to_dict(), **config }
+    if config["task"] == "color":
+        metrics = {
+            "rgb_acc"  : utils.Metric(fn=utils.rgb_accuracy, scale_rgb=True, window_size=8),
+            "rgb_dist" : utils.Metric(fn=utils.redmean_rgb_dist, scale_rgb=True)
+        }
+        N_CLASSES = config["n_colors"]*3 #RGB
 
-    y_transform = TransformY(n_colors=config["n_colors"])
+    elif config["task"] == "genre":
+        metrics = {
+            "class_acc" : utils.Metric(fn=utils.class_accuracy, is_logits=True),
+            "f1_score"  : utils.Metric(fn=utils.multiclass_f1score, is_logits=True, average="macro")
+        }
+        N_CLASSES = len(GTZAN_CLASSES)
+
+    if config["pretraining"]:
+        metrics = {}
+
+    y_transform = TransformY(task=config["task"], 
+                             n_colors=config["n_colors"])
     
     X_transform = TransformX(n_patches=config["n_patches"],
                              pad_method="mean",
@@ -288,34 +365,50 @@ if __name__=="__main__":
     print("CUDA:", use_cuda)
 
     # -------------------------PREPARE DATA------------------------- #
-    train_paths, valid_paths, test_paths = split_samples_by_song(
+    if config["task"] == "color":
+        filename_parser = dataload.youtube_filename_parser
+        loader = WavToSpecColorDataset
+        ac_map = WavToSpecColorDataset.gen_audio_color_map(AUDIO_COLOR_MAP)
+        class_encoding = None
+    elif config["task"] == "genre":
+        filename_parser = dataload.gtzan_filename_parser
+        loader = WavToSpecGTZANDataset
+        ac_map = None
+        class_encoding = GTZAN_CLASSES
+
+    ## Load train/test splits, create train/valid split
+    train_paths, valid_paths, test_paths = dataload.split_samples_by_song(
         audio_dir     =AUDIO_DIR,
         splitmeta_path=SPLITMETA_PATH,
+        filename_parser=filename_parser,
         valid_share   =0.1,
         test_share    =0.2,
         random_seed   =seed
     )
-    ac_map = AudioToSpecDataset.gen_audio_color_map(AUDIO_COLOR_MAP)
-
-    train_dataset = DATALOADER(train_paths,
+    ## Prepare train and valid datasets
+    train_dataset =     loader(train_paths,
                                audio_data_dir=AUDIO_DIR,
                                audio_color_map=ac_map,
+                               class_encoding=class_encoding,
                                X_transform=X_transform,
                                y_transform=y_transform,
                                spec_augment=spec_augment
                                )
 
-    valid_dataset = DATALOADER(valid_paths, 
+    valid_dataset =     loader(valid_paths, 
                                audio_data_dir=AUDIO_DIR,
                                audio_color_map=ac_map,
+                               class_encoding=class_encoding,
                                X_transform=X_transform,
-                               y_transform=y_transform)
+                               y_transform=y_transform
+                               )
 
     print("Train Samples:", len(train_dataset), 
         "\nValid Samples:", len(valid_dataset),
         "\nBatch Size:", config["batch_size"],
         "| Effective Batch Size:", config["batch_size"] * config["gradient_accumulation_steps"])
 
+    ## Create Train/Valid Dataloaders
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size = config["batch_size"],
@@ -325,8 +418,9 @@ if __name__=="__main__":
         pin_memory = True if use_cuda else False
     )
 
-    valid_batchsize = (config["batch_size"] - 2)*config["gradient_accumulation_steps"]
-    if config["gradient_accumulation_steps"] == 1:
+    if config["gradient_accumulation_steps"] > 1:
+        valid_batchsize = (config["batch_size"] - 2)*config["gradient_accumulation_steps"]
+    else:
         valid_batchsize = config["batch_size"]
 
     valid_dataloader = torch.utils.data.DataLoader(
@@ -340,40 +434,45 @@ if __name__=="__main__":
 
     # -------------------------PREPARE MODEL------------------------- #
     model_exists = False
-    if LOAD_CHECKPOINT is not None and os.path.exists(LOAD_CHECKPOINT):
+    if CHECKPOINT is not None and os.path.exists(CHECKPOINT):
         model_exists = True
 
     start_epoch = 0
-    if not LOAD_CHECKPOINT or not model_exists:
-        print(f"Preparing new model: {MODEL_SAVE_NAME}.")
-        ex_x, _,_ = train_dataset[0]
-        model = MODEL_CLASS(X_shape=ex_x.shape, config=MODEL_CONFIG())
+    ex_x, _,_ = train_dataset[0]
+    newmodel = MODEL_CLASS(X_shape=ex_x.shape, 
+                        n_classes=N_CLASSES,
+                        config=MODEL_CONFIG())
 
-    else:
-        print(f"Loading model checkpoint: {LOAD_CHECKPOINT}")
-        model = torch.load(LOAD_CHECKPOINT)
-        config_old = utils.load_json(LOAD_CHECKPOINT_CONFIG)
+    if CHECKPOINT and model_exists:
+        print(f"Loading model checkpoint: {CHECKPOINT}", end="... ")
+        oldmodel = torch.load(CHECKPOINT)
+        config_old = utils.load_json(CHECKPOINT_CONFIG)
         if CONTINUE_RUN:
+            print("Continuing run.")
             start_epoch = config_old['last_epoch']
             config["run_id"] = config_old["run_id"]
+            model = oldmodel
+        else:
+            print("Transferring weights.")
+            model = transfer_weights(oldmodel, newmodel)
+    else:
+        print("Preparing new model.")
+        model = newmodel
 
     model = model.to(device)
-    print(f"Model params: {model.n_params :,}")
+    print(f"Training model: {MODEL_SAVE_NAME}")
+    print(f"Total params: {model.n_params :,}")
 
-    print("Freezing" if config["freeze_embeddings"] else "Training", "embedding layers.")
-    print("Freezing" if config["freeze_transformer"] else "Training", "transformer layers.")
-    print("Freezing" if config["freeze_head"] else "Training", "head/classification layers.")
+    # Freeze Parameters
+    assert [g for g in model.groups.keys()] == config["optim_groups"]
 
-    for name, child in model.named_children():
-        if ("ln_0" in name or "linear_proj" in name or "embed" in name) and config["freeze_embeddings"]:
-            for param in child.parameters():
+    for i, group in enumerate(config["optim_groups"]):
+        print(f"{group.capitalize()}:", "freezing" if config["freeze_groups"][i] else "training")
+        if config["freeze_groups"][i]:
+            for param in model.groups[group].parameters():
                 param.requires_grad = False
-        if ("transformer" in name) and config["freeze_transformer"]: 
-            for param in child.parameters():
-                param.requires_grad = False
-        if ("head" in name) and config["freeze_head"]:
-            for param in child.parameters():
-                param.requires_grad = False
+
+    print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) :,}")
 
     # Change dropout percentages if the config calls for modified values
     model = utils.update_dropout_p(model, config, verbose=True)
@@ -393,16 +492,17 @@ if __name__=="__main__":
         wandb.watch(model)
 
     # -------------------------LOSS & OPTIM------------------------- #
-    criterion = nn.MSELoss()
-    
-    assert [n for n in model.groups.keys()] == config["optim_groups"]
+    if config["task"] == "color" or config["pretraining"]:
+        criterion = nn.MSELoss()
+    elif config["task"] == "genre":
+        criterion = nn.CrossEntropyLoss()
 
     param_groups = []
-    for name in config["optim_groups"]:
+    for group in config["optim_groups"]:
         param_groups.append({
-            "params"  : model.groups[name].parameters(),
-            "lr"      : config["lrs"][name],
-            "name"    : name
+            "params"  : model.groups[group].parameters(),
+            "lr"      : config["lrs"][group],
+            "name"    : group
         })
     optimizer = torch.optim.AdamW(
         param_groups, 
@@ -410,42 +510,51 @@ if __name__=="__main__":
         weight_decay=config['weight_decay'])
 
     # -------------------------TRAIN LOOP------------------------- #
-    ep_losses, ep_dists, ep_accs = [], [], []
-    val_losses, val_dists, val_accs = [], [], []
+    ep_losses = []
+    val_losses = []
     try:
         for ep in range(start_epoch, start_epoch+config["epochs"]):
+            if not torch.cuda.is_available() and use_cuda:
+                raise ValueError("GPU is Lost. Exiting and saving. Reboot system.") 
 
-            optimizer, new_lrs = resolve_lr(optimizer, config, step=ep, start_epoch=start_epoch)
+            optimizer, new_lrs = resolve_lr(optimizer, config, step = ep - start_epoch)
             new_lrs = ' / '.join([f'{l :.2E}' for l in new_lrs])
 
             time0 = time.time()
             print(f"\nEPOCH {ep+1} / {start_epoch+config['epochs']} (embed/trfmr/head lrs={new_lrs})")
-            
-            el, ed, ea = batched_trainloop(train_dataloader, 
+        
+            train_metrics = copy.deepcopy(metrics)
+            train_loss, train_metrics = batched_trainloop(
+                                           train_dataloader, 
                                            model=model, 
-                                           criterion=criterion, 
+                                           criterion=criterion,
+                                           metrics=train_metrics,
                                            optimizer=optimizer,
                                            config=config, 
                                            device=device,
                                            batch_print_freq=config["batch_print_freq"])
-            ep_losses.append(el.mean)
-            ep_dists.append(ed.mean)
-            ep_accs.append(ea.mean)
+            ep_losses.append(train_loss.mean)
 
+            metric_str = ' \t'.join([
+                f"{k}={train_metrics[k].batch.mean :.5f}" for k in train_metrics.keys()
+            ])
             print(f" * Epoch Means: ",
-                f"Loss={el.mean :.5f} \tRGBDist={ed.mean :.5f} \tRGBAcc={ea.mean :.5f}")
+                f"Loss={train_loss.mean :.5f} \t{metric_str}")
 
-            vl, vd, va = batched_validloop(valid_dataloader,
+            valid_metrics = copy.deepcopy(metrics)
+            val_loss, metrics = batched_validloop(valid_dataloader,
                                            model=model, 
                                            criterion=criterion,
+                                           metrics=metrics,
                                            config=config,
                                            device=device)
-            val_losses.append(vl.mean)
-            val_dists.append(vd.mean)
-            val_accs.append(va.mean)
+            val_losses.append(val_loss.mean)
 
+            metric_str = ' \t'.join([
+                f"{k}={valid_metrics[k].batch.mean :.5f}" for k in valid_metrics.keys()
+            ])
             print(f" * Valid Means: "
-                f"Loss={vl.mean :.5f} \tRGBDist={vd.mean :.5f} \tRGBAcc={va.mean :.5f}")
+                f"Loss={val_loss.mean :.5f} \t{metric_str}")
 
             stp_time = time.time() - time0
             print(f" * Epoch+Valid Time: {stp_time :.1f}s (Est. Train Time ~= {stp_time * (config['epochs']) / (60*60):.2f} hrs)")
@@ -454,20 +563,25 @@ if __name__=="__main__":
 
 
             if LOG_WANDB:
+                log_metrics = {}
+                for m in train_metrics.keys():
+                    log_metrics[f"{m}"] = train_metrics[m].batch.mean
+                for m in valid_metrics.keys():
+                    log_metrics[f"val_{m}"] = valid_metrics[m].batch.mean
                 wandb.log({
-                    "loss"     : el.mean, "val_loss"     : vl.mean,
-                    "rgb_dist" : ed.mean, "val_rgb_dist" : vd.mean,
-                    "acc"      : ea.mean, "val_acc"      : va.mean,
+                    "loss"     : train_loss.mean, 
+                    "val_loss" : val_loss.mean,
                     "embed_lr" : optimizer.param_groups[0]["lr"],
                     "trfmr_lr" : optimizer.param_groups[1]["lr"],
-                    "head_lr"  : optimizer.param_groups[2]["lr"]
+                    "head_lr"  : optimizer.param_groups[2]["lr"],
+                    **log_metrics
                 })
 
             if config["checkpoint_save_freq"] is not None and (ep+1) % config["checkpoint_save_freq"] == 0:
                 print("Saving model checkpoint.")
                 config["last_epoch"] = ep
                 utils.save_model_with_shape(model, 
-                                save_dir="./checkpoints",
+                                save_dir=MODEL_SAVE_DIR,
                                 save_name=f"{MODEL_SAVE_NAME}_ep{ep}", 
                                 config_file=f"{MODEL_SAVE_NAME}_config.json", 
                                 config=config)
@@ -498,7 +612,7 @@ if __name__=="__main__":
     if SAVE_CHECKPOINT:
         # Save model and configuration
         utils.save_model_with_shape(model, 
-                                    save_dir="./checkpoints",
+                                    save_dir=MODEL_SAVE_DIR,
                                     save_name=MODEL_SAVE_NAME, 
                                     config_file=f"{MODEL_SAVE_NAME}_config.json", 
                                     config=config)
