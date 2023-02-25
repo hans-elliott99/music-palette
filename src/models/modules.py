@@ -54,13 +54,26 @@ class LinearProjection(nn.Module):
     def forward(self, x):
         return self.proj_dropout(self.linear(x))
 
+
+class DenseLayer(nn.Module):
+    def __init__(self, in_feats, out_feats, dropout=0., bias=True) -> None:
+        super().__init__()
+        self.ln     = nn.LayerNorm(in_feats)
+        self.linear = nn.Linear(in_feats, out_feats, bias=bias)
+        self.gelu   = nn.GELU()
+        self.dropout= nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.dropout(self.gelu(self.linear(self.ln(x))))
+
+
 class MLP_Trfmr(nn.Module):
     def __init__(self, in_feats, hidden_ratio=4, dropout=0.):
         #default in_feats*4, as in Attention is All You Need & An Image Is Worth 16X16 Words (ViT)
         super().__init__()
         self.linear_in  = nn.Linear(in_feats, hidden_ratio*in_feats)
         self.gelu       = nn.GELU()
-            # project back into residual pathway
+        # project back into residual pathway
         self.linear_out = nn.Linear(hidden_ratio*in_feats, in_feats)
         self.mlp_dropout= nn.Dropout(dropout)
 
