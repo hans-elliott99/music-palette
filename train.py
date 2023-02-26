@@ -267,11 +267,11 @@ if __name__=="__main__":
     LOG_WANDB       = True
     SAVE_CHECKPOINT = True
     WANDB_RUN_GROUP = "GPTPatchTransformer_GTZAN"
-    CONTINUE_RUN    = True
+    CONTINUE_RUN    = False
 
-    MODEL_SAVE_NAME   = "gtzan_ft_0"
+    MODEL_SAVE_NAME   = "gtzan_ft_1"
     MODEL_SAVE_DIR    = "./checkpoints"
-    load_model_name   = "" or MODEL_SAVE_NAME
+    load_model_name   = "gtzan_gpt_pt" or MODEL_SAVE_NAME
     CHECKPOINT        = f"./checkpoints/{load_model_name}.pth" #will be created if doesnt exist
     CHECKPOINT_CONFIG = f"./checkpoints/{load_model_name}_config.json"
 
@@ -298,15 +298,15 @@ if __name__=="__main__":
         # Optimization
         "optim_groups" : ["embeddings", "transformers", "heads"],
         "freeze_groups": [True, False, False],
-        "lrs" : {"embeddings":6e-4, "transformers":6e-4, "heads":6e-4}, #also the max lrs if decay_lr==True
+        "lrs" : {"embeddings":6e-6, "transformers":6e-5, "heads":6e-5}, #also the max lrs if decay_lr==True
         "betas" : (0.9, 0.999),
         "grad_clip" : 1.0, #disabled if 0
-        "weight_decay" : 1e-1,
+        "weight_decay" : 1.,
         "gradient_accumulation_steps" : 1, #to simulate larger batch-sizes
 
         # LR Scheduling
         "decay_lrs" : {"embeddings":True, "transformers":True, "heads":True},
-        "min_lrs" : {"embeddings":6e-5, "transformers":6e-5, "heads":6e-5},
+        "min_lrs" : {"embeddings":6e-7, "transformers":6e-6, "heads":6e-6},
         "lr_warmup_steps" : {"embeddings":5, "transformers":5, "heads":5},
         "lr_decay_steps" : {"embeddings":epochs-5, "transformers":epochs-5, "heads":epochs-5}
     }
@@ -445,7 +445,7 @@ if __name__=="__main__":
 
     if CHECKPOINT and model_exists:
         print(f"Loading model checkpoint: {CHECKPOINT}", end="... ")
-        oldmodel = torch.load(CHECKPOINT)
+        oldmodel = torch.load(CHECKPOINT, map_location=device)
         config_old = utils.load_json(CHECKPOINT_CONFIG)
         if CONTINUE_RUN:
             print("Continuing run.")
@@ -542,10 +542,10 @@ if __name__=="__main__":
                 f"Loss={train_loss.mean :.5f} \t{metric_str}")
 
             valid_metrics = copy.deepcopy(metrics)
-            val_loss, metrics = batched_validloop(valid_dataloader,
+            val_loss, valid_metrics = batched_validloop(valid_dataloader,
                                            model=model, 
                                            criterion=criterion,
-                                           metrics=metrics,
+                                           metrics=valid_metrics,
                                            config=config,
                                            device=device)
             val_losses.append(val_loss.mean)
