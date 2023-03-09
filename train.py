@@ -257,6 +257,8 @@ if __name__=="__main__":
 
     #NOTE:
     #Try higher weight decay for regualrization.
+    #Try a much bigger model with regularizationg.
+    #Also, just try implenting a SOTA model.
     # -------------------------USER CONTROL------------------------- #
     seed = 87271
     task = "genre" #genre or color
